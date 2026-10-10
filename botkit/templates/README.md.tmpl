@@ -1,0 +1,40 @@
+# {{BOT_NAME}}
+
+用 botkit 搭的企业微信Agent。
+
+## 这个目录里有什么
+
+| 文件 | 作用 | 要不要改 |
+|---|---|---|
+| `bot.yaml` | 全部配置：LLM、MCP 工具、身份规则、会话、文案 | 要 |
+| `prompt.md` | 这个Agent是谁、要做什么 | 要 |
+| `.env` | 密钥（不提交 git），从 `.env.example` 复制 | 要 |
+| `.env.example` | 密钥模板 | 不用 |
+| `hooks.py` | 可选的代码扩展点，默认全注释 | 一般不用 |
+
+## 常用命令
+
+在 `bot-demo` 目录下执行：
+
+```bash
+python -m botkit validate {{BOT_DIR}}    # 校验配置，打印摘要（密钥打码）
+python -m botkit run {{BOT_DIR}}         # 启动（连企微；开了对外接口会一并起 /chat）
+python -m botkit serve-api {{BOT_DIR}}   # 只起对外 chat 接口（不连企微，对接 Dify/门户）
+```
+
+连企微时，看到 `认证成功，Agent {{BOT_NAME}} 已上线` 就通了。
+只跑接口时，看到 `chat 接口已启动：POST http://0.0.0.0:<端口>/chat` 就通了。
+
+排查用：
+
+```bash
+python tools/wecom_probe.py {{BOT_DIR}}  # 企微给的用户身份是什么
+python tools/mcp_probe.py  {{BOT_DIR}}   # 能拿到哪些工具
+```
+
+## 文档
+
+- 建 Agent 的完整步骤：`docs/新建Bot步骤说明书.md`
+- 配置字段查阅：`docs/配置参考.md`
+
+改配置和提示词都不需要动 Python 代码，重启即生效。

@@ -1,0 +1,25 @@
+# 密钥，绝对不能提交
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# 临时文件
+_*.txt
+_tmp*
+门户架构决策.md
+
+
+# 删除Agent的回收站（本地找回用，不进 git）
+# 忽略 bots 目录下的所有Agent配置，但保留目录结构
+bots/*
+!bots/.gitkeep
+demandDoc/
+.vscode

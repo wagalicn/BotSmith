@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>botkit Agent 配置页面</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-title">
+    <strong>botkit</strong> Agent 配置页面
+  </div>
+  <div class="topbar-note">只有本机能访问 · 改完记得点保存</div>
+</header>
+
+<div class="layout">
+
+  <!-- 左侧：bot 列表 -->
+  <nav class="sidebar" aria-label="Agent列表">
+    <div class="sidebar-head">
+      <h2>Agent</h2>
+      <div class="sidebar-head-btns">
+        <button type="button" id="btn-import" class="btn btn-small">导入</button>
+        <button type="button" id="btn-new" class="btn btn-small">新建</button>
+      </div>
+    </div>
+    <ul id="bot-list" class="bot-list"></ul>
+    <p class="sidebar-hint">
+      配置改完在命令行启动：<br>
+      <code id="run-hint">python -m botkit run bots/…</code>
+    </p>
+  </nav>
+
+  <!-- 右侧：表单 -->
+  <main class="content" id="content" hidden>
+
+    <div class="content-head">
+      <div class="content-head-row">
+        <h1 id="bot-title">—</h1>
+        <div class="content-head-actions">
+          <button type="button" id="btn-export" class="btn btn-ghost btn-small">导出 JSON</button>
+          <button type="button" id="btn-delete" class="btn btn-ghost btn-danger btn-small">删除这个Agent</button>
+        </div>
+      </div>
+      <nav class="tabs" id="tabs" aria-label="配置分区"></nav>
+    </div>
+
+    <div class="panels">
+
+      <!-- 密钥 -->
+      <section class="panel" data-panel="secrets">
+        <h2>密钥</h2>
+        <p class="desc">
+          这些值来自企微后台和平台管理员，存在本 bot 目录的 <code>.env</code> 里，
+          不会进 git。下面的条目是根据配置里用到的占位符自动列出来的。
+          <strong>如果这个Agent只做对外接口（不连企业微信），企微 bot_id / bot_secret 可以留空</strong>——
+          去「对外接口」页开启 chat 接口即可。
+        </p>
+        <div id="env-fields" class="fields"></div>
+        <div class="row">
+          <button type="button" id="btn-toggle-secrets" class="btn btn-ghost">显示明文</button>
+        </div>
+
+        <div class="probe-box">
+          <h3>验证企微连接</h3>
+          <p class="desc">
+            先确认凭证对不对，再确认Agent能不能认出说话的人是谁 ——
+            这两步是新建 bot 最容易卡住的地方。
+          </p>
+          <div class="row">
+            <button type="button" id="btn-test-wecom" class="btn">测试凭证</button>
+            <button type="button" id="btn-wait-wecom" class="btn">等我在企微 @ 一句话</button>
+          </div>
+          <div id="wecom-result" class="probe-result" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- 模型 -->
+      <section class="panel" data-panel="llm" hidden>
+        <h2>大模型</h2>
+        <div id="llm-fields" class="fields"></div>
+      </section>
+
+      <!-- 工具 -->
+      <section class="panel panel-wide" data-panel="tools" hidden>
+        <h2>工具</h2>
+        <p class="desc">
+          Agent的能力来自 MCP 服务端提供的工具。可以接多个服务端 ——
+          比如同时连 IT 工单中台和 CRM。每个服务端配好后点「探测」，
+          把它实际有的工具列出来，勾上这个Agent需要用的。
+          <strong>勾得越少模型越不容易选错，也越省 token。</strong>
+        </p>
+
+        <h3>MCP 服务端</h3>
+        <div id="server-list"></div>
+        <div class="row">
+          <button type="button" id="btn-add-server" class="btn btn-small">＋ 添加一个服务端</button>
+          <span class="hint">地址直接填明文，会存进本地 .env、不进 git</span>
+        </div>
+
+        <div class="row" style="margin-top:16px">
+          <button type="button" id="btn-probe-mcp" class="btn btn-primary">探测全部服务端的工具</button>
+          <span class="hint">需要先保存并通过校验</span>
+        </div>
+        <div id="mcp-result" class="probe-result" aria-live="polite"></div>
+        <div id="tool-picker"></div>
+      </section>
+
+      <!-- 身份 -->
+      <section class="panel" data-panel="identity" hidden>
+        <h2>身份与安全</h2>
+        <div id="identity-fields" class="fields"></div>
+
+        <div class="probe-box warn-box">
+          <h3>防止模型替别人操作</h3>
+          <p class="desc">
+            模型会自己编参数。如果某个工具有「这是谁提的」这类参数
+            （工单的提交人、报销的申请人），一定要在这里绑定成「当前用户」。
+            绑定之后，框架会在真正调用前用企微那边拿到的身份覆盖掉模型填的值。
+          </p>
+          <div id="inject-rows"></div>
+          <div class="row">
+            <button type="button" id="btn-add-inject" class="btn btn-small">添加一条绑定</button>
+            <span class="hint" id="inject-hint"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 提示词 -->
+      <section class="panel panel-wide" data-panel="prompt" hidden>
+        <h2>提示词</h2>
+        <p class="desc">
+          写清这个Agent是谁、要做什么、按什么顺序调工具、不许做什么。
+          <strong>这一步决定Agent好不好用，比调任何参数都重要。</strong>
+          约束用「严禁」「必须」这类硬词比「建议」有效。
+          文件后缀是 <code>.md</code>，但不强制 Markdown 语法 ——
+          整段文本会原样交给模型，右边的预览只是帮你看排版。
+        </p>
+        <div class="prompt-split">
+          <div class="prompt-edit">
+            <label class="sr-only" for="prompt-text">提示词内容</label>
+            <textarea id="prompt-text" spellcheck="false" rows="24"></textarea>
+            <p class="hint" id="prompt-meta"></p>
+          </div>
+          <div class="prompt-preview">
+            <div class="preview-tabs">
+              <button type="button" class="preview-tab active" data-view="rendered">预览</button>
+              <button type="button" class="preview-tab" data-view="check">结构检查</button>
+            </div>
+            <div id="prompt-rendered" class="rendered-md"></div>
+            <div id="prompt-check" class="prompt-check" hidden></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 技能 -->
+      <section class="panel" data-panel="skills" hidden>
+        <h2>技能</h2>
+        <p class="desc">
+          技能是补充给Agent的说明文档（业务规则、术语表、FAQ 等）。
+          启用后，勾选的文档会拼进系统提示词，Agent遇到需要理解的说明就能参考。
+          文档存在共享目录里，多个Agent可以各自勾选需要的那几份。
+        </p>
+        <div id="skills-panel"></div>
+      </section>
+
+      <!-- 会话 -->
+      <section class="panel" data-panel="session" hidden>
+        <h2>会话上下文</h2>
+        <div id="session-fields" class="fields"></div>
+      </section>
+
+      <!-- 文案 -->
+      <section class="panel" data-panel="messages" hidden>
+        <h2>文案</h2>
+        <p class="desc">Agent在各种情况下说的话。留空则用框架默认值。</p>
+        <div id="message-fields" class="fields"></div>
+
+        <h3>重置关键词</h3>
+        <p class="desc">用户发这些词会清空对话。整条消息完全等于其中一个才算命中。</p>
+        <div id="keyword-editor"></div>
+
+        <h3>工具进度提示</h3>
+        <p class="desc">调用工具前推给用户的提示。工具慢的时候体验差别很大。</p>
+        <div id="progress-editor"></div>
+      </section>
+
+      <!-- 前置拦截 -->
+      <section class="panel panel-wide" data-panel="intercepts" hidden>
+        <h2>前置拦截</h2>
+        <p class="desc">
+          用户消息命中规则时，直接回固定文案，不进大模型 —— 快、省 token、答案稳定。
+          适合帮助菜单、常见问答、固定话术。命中优先级：重置关键词 &gt; 拦截规则 &gt; 大模型。
+        </p>
+        <div id="intercepts-editor"></div>
+      </section>
+
+      <!-- 对外接口 -->
+      <section class="panel panel-wide" data-panel="api" hidden>
+        <h2>对外接口</h2>
+        <p class="desc">
+          把这个Agent开成一个 HTTP 接口（POST /chat），供 Dify、内部门户或其它系统调用。
+          可以和企业微信同时用，也可以只开接口、不连企微。
+          调用方负责传 user（用户标识）和 session_id（会话 ID）。
+        </p>
+        <div id="api-fields" class="fields"></div>
+      </section>
+
+      <!-- 预览测试 -->
+      <section class="panel panel-wide" data-panel="preview" hidden>
+        <h2>预览测试</h2>
+        <p class="desc">
+          不连企业微信，直接在这儿跟Agent聊两句看效果。走的是和正式运行
+          一模一样的流程 —— 真调大模型、真调 MCP 工具。用来验证提示词写得对不对、
+          工具选得全不全、身份注入生效没有。
+        </p>
+        <div class="note warn" id="preview-warning">
+          注意：预览会<strong>真的执行工具</strong>。如果提示词触发了「创建工单」
+          这类动作，这里会真建一张单。拿测试数据试，别用真实业务信息。
+        </div>
+        <div class="row">
+          <label class="field-label" for="preview-identity" style="margin:0">用哪个身份测试</label>
+          <input type="text" id="preview-identity" class="narrow" placeholder="留空自动用一个示例工号" autocomplete="off">
+        </div>
+
+        <div id="preview-chat" class="preview-chat" aria-live="polite"></div>
+
+        <div class="preview-input">
+          <textarea id="preview-message" rows="2" spellcheck="false"
+            placeholder="输入一句话，比如：我想请三天年假"></textarea>
+          <div class="preview-input-buttons">
+            <button type="button" id="btn-preview-send" class="btn btn-primary">发送</button>
+            <button type="button" id="btn-preview-clear" class="btn btn-ghost btn-small">清空对话</button>
+          </div>
+        </div>
+        <p class="hint">按 Enter 发送，Shift+Enter 换行。预览的对话不会保存。</p>
+      </section>
+
+      <!-- 高级 -->
+      <section class="panel" data-panel="advanced" hidden>
+        <h2>其他</h2>
+        <div id="advanced-fields" class="fields"></div>
+        <h3>代码扩展点</h3>
+        <div id="hooks-info" class="probe-result"></div>
+        <h3>当前配置摘要</h3>
+        <pre id="summary" class="summary"></pre>
+      </section>
+
+    </div>
+
+    <!-- 底部固定条 -->
+    <div class="actionbar">
+      <div id="status" class="status" aria-live="polite">—</div>
+      <div class="actionbar-buttons">
+        <button type="button" id="btn-validate" class="btn btn-ghost">重新校验</button>
+        <button type="button" id="btn-save" class="btn btn-primary">保存</button>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- 未选中任何 bot 时 -->
+  <main class="content empty" id="empty-state">
+    <div class="empty-inner">
+      <h1>先选一个Agent</h1>
+      <p>从左边选一个，或者点「新建」建一个新的。</p>
+    </div>
+  </main>
+
+</div>
+
+<!-- 新建对话框 -->
+<dialog id="new-dialog">
+  <form method="dialog" id="new-form">
+    <h2>新建Agent</h2>
+    <label for="new-name">名字</label>
+    <input id="new-name" type="text" placeholder="hr-assistant" autocomplete="off" required>
+    <p class="hint">
+      会作为目录名。字母开头，只能用字母、数字、下划线、连字符。
+    </p>
+    <p class="dialog-error" id="new-error" aria-live="polite"></p>
+    <div class="dialog-buttons">
+      <button type="button" id="new-cancel" class="btn btn-ghost">取消</button>
+      <button type="submit" id="new-submit" class="btn btn-primary">创建</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 导入对话框 -->
+<dialog id="import-dialog">
+  <form method="dialog" id="import-form">
+    <h2>导入Agent</h2>
+    <p class="hint">
+      粘贴一份导出的Agent JSON，或选一个 <code>.json</code> 文件。
+      导入只建配置结构，<strong>不含密钥</strong> —— 导入后去「密钥」页填。
+    </p>
+    <label for="import-file">从文件选择</label>
+    <input id="import-file" type="file" accept="application/json,.json">
+    <label for="import-text">或直接粘贴 JSON</label>
+    <textarea id="import-text" rows="10" spellcheck="false" placeholder='{ "name": "...", "values": { ... }, "prompt": "..." }'></textarea>
+    <p class="dialog-error" id="import-error" aria-live="polite"></p>
+    <div class="dialog-buttons">
+      <button type="button" id="import-cancel" class="btn btn-ghost">取消</button>
+      <button type="submit" id="import-submit" class="btn btn-primary">导入</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

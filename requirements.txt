@@ -1,0 +1,30 @@
+# botkit 依赖
+#
+# 安装：pip install -r requirements.txt
+# 需要 Python 3.11+（用到了 BaseExceptionGroup）
+
+# --- 企业微信智能机器人 SDK（长连接） ---
+wecom-aibot-python-sdk>=1.0.2,<2
+
+# --- MCP 客户端 ---
+# 必须钉在 2.x。代码用的是 v2 API（mcp.Client、httpx2、input_schema 等
+# snake_case 字段），装到 1.x 会直接崩。
+# pip install mcp 现在默认给 2.x，但显式钉住免得日后 3.0 出来又炸。
+mcp>=2.2,<3
+# MCP v2 用 httpx2 替代了 httpx/httpx-sse，跟着 mcp 一起装但显式写出来
+# —— 我们自己也直接 import 它来挂身份头
+httpx2>=2.13,<3
+
+# --- LLM 后端 ---
+# openai 后端（默认）
+openai>=3.14,<4
+# aiohttp 后端（备用，用于不规范的 OpenAI 兼容端点）
+aiohttp>=3.14,<4
+
+# --- 配置 ---
+PyYAML>=6.0,<7
+python-dotenv>=1.2,<2
+
+# --- 测试（部署时不需要）---
+pytest>=9.1,<10
+pytest-asyncio>=1.4,<2

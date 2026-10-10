@@ -1,0 +1,80 @@
+"""
+{{BOT_NAME}} 的代码扩展点。
+
+大部分Agent不需要写这里的任何代码 —— bot.yaml + prompt.md 就够了。
+下面全部注释掉，需要哪个就取消注释。
+
+框架只认这 5 个函数名，同步和 async def 都支持，没定义的走框架默认行为。
+hook 抛异常时框架会记日志并降级到默认行为，不会让整条消息挂掉，
+所以不用在里面写一堆 try/except。
+
+ctx 上可以拿到：
+    ctx.identity      当前用户身份（经过 identity.pattern 校验的）
+    ctx.session_key   会话隔离 key
+    ctx.config        BotConfig，整份配置
+    ctx.logger        日志器
+    ctx.frame         企微原始消息帧（消息类 hook 才有）
+"""
+
+
+# def resolve_identity(frame):
+#     """
+#     自定义身份解析。返回 None 表示解析失败，框架会回复
+#     messages.identity_invalid 并终止本轮。
+#
+#     什么时候需要：企微给的 userid 不是业务系统认的工号（比如是加密串），
+#     需要在这里查表映射。配合 bot.yaml 里 identity.source: hook 使用。
+#     不实现时框架默认取 frame["body"]["from"]["userid"]。
+#     """
+#     userid = frame.get("body", {}).get("from", {}).get("userid", "")
+#     return USERID_TO_WORKCODE.get(userid)
+
+
+# def on_message(text, ctx):
+#     """
+#     前置拦截。返回字符串就直接用它回复，不进 LLM；返回 None 继续正常流程。
+#
+#     什么时候需要：帮助菜单、固定问答、敏感词拦截这类不需要模型参与的场景。
+#     省 token，响应也快。
+#     注意：重置关键词的优先级比这个高，用户始终能清空对话。
+#     """
+#     if text.strip() in ("帮助", "help", "?"):
+#         return "我能帮你：\n1. xxx\n2. yyy\n直接描述需求即可。"
+#     return None
+
+
+# def before_tool_call(tool_name, args, ctx):
+#     """
+#     工具调用前改写参数，必须返回 dict。
+#
+#     执行时机在 identity.inject 之后，所以这里能看到已经注入的身份参数，
+#     也能覆盖它（hook 是最后一道）。改动会同步到回灌给 LLM 的上下文里。
+#
+#     什么时候需要：补默认值、单位换算、字段改名、按人加默认部门等。
+#     """
+#     if tool_name == "your_tool":
+#         args.setdefault("some_optional_arg", "默认值")
+#     return args
+
+
+# def after_tool_call(tool_name, result, ctx):
+#     """
+#     工具返回结果加工，必须返回字符串（这是喂给 LLM 的内容）。
+#
+#     什么时候需要：裁剪超长返回（省 token）、脱敏、把原始 JSON 整理成
+#     模型更好读的格式。
+#     """
+#     if len(result) > 4000:
+#         return result[:4000] + "\n（结果过长已截断）"
+#     return result
+
+
+# def before_reply(text, ctx):
+#     """
+#     最终回复发出前加工，必须返回字符串。
+#     只作用于 LLM 产生的回复，不影响报错和固定文案。
+#     加工后的内容会被存进会话历史。
+#
+#     什么时候需要：统一署名、追加帮助入口、格式化。
+#     """
+#     return text + "\n\n—— {{BOT_NAME}}"
