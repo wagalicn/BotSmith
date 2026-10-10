@@ -45,8 +45,8 @@ and files edited by hand still open fine in the page.
 
 | What you want | Where to go |
 |---|---|
-| **Building an Agent for the first time** | [Guide: Creating a New Agent](docs/新建Bot步骤说明书.en.md) —— 10 steps, mainly via the config page, each with expected results and troubleshooting |
-| **How to configure a specific field** | [Configuration Reference](docs/配置参考.en.md) —— all `bot.yaml` fields, hooks, dual backends, processing pipeline |
+| **Building an Agent for the first time** | [Guide: Creating a New Agent](docs/creating-a-new-agent.md) —— 10 steps, mainly via the config page, each with expected results and troubleshooting |
+| **How to configure a specific field** | [Configuration Reference](docs/configuration-reference.md) —— all `bot.yaml` fields, hooks, dual backends, processing pipeline |
 | What this project is about | This file |
 
 ---
@@ -76,12 +76,12 @@ GET  http://<server IP>:<port>/health         # liveness check, no auth
   and the Agent passes them through statelessly. Consecutive requests with the same `session_id` = continuous multi-turn; without it, isolation is by `user`.
 - The API binds to `0.0.0.0` (reachable on the intranet), only chats and never reads/writes secrets, a different trade-off from the "config page" (bound to localhost only).
 
-See the [api section in the Configuration Reference](docs/配置参考.en.md#api--external-api) for fields and Dify integration details.
+See the [api section in the Configuration Reference](docs/configuration-reference.md#api--external-api) for fields and Dify integration details.
 
 **Need a dedicated endpoint beyond `/chat`?** An Agent can implement `register_routes` in its own `hooks.py`
 to attach custom HTTP routes (structured analysis, bulk import, etc.) to the same service, without changing the skeleton.
 **This one requires Python code**; for usage, examples, and a checklist see the
-[custom routes section in the Configuration Reference](docs/配置参考.en.md#attaching-an-agents-own-custom-routes-register_routes).
+[custom routes section in the Configuration Reference](docs/configuration-reference.md#attaching-an-agents-own-custom-routes-register_routes).
 
 ---
 
@@ -91,7 +91,7 @@ When a message comes in (from the `/chat` API or WeCom), the framework processes
 intercept empty messages/reset words/hooks → fetch whitelisted MCP tools → LLM function-calling loop →
 reply → store context.
 
-See the [pipeline description in the Configuration Reference](docs/配置参考.en.md#the-frameworks-processing-pipeline) for each step.
+See the [pipeline description in the Configuration Reference](docs/configuration-reference.md#the-frameworks-processing-pipeline) for each step.
 
 Built in, so you don't have to worry about it:
 
@@ -110,7 +110,7 @@ Built in, so you don't have to worry about it:
 - **External chat API**: a single `POST /chat` exposes the Agent to Dify / an internal portal / any third party
 - **Custom HTTP endpoints**: when an Agent needs a dedicated endpoint beyond `/chat`, attach it via the `register_routes`
   extension point without changing the skeleton. **This one requires Python code** (unlike the dialog/tools/copy that are pure config),
-  see the [Configuration Reference](docs/配置参考.en.md#attaching-an-agents-own-custom-routes-register_routes)
+  see the [Configuration Reference](docs/configuration-reference.md#attaching-an-agents-own-custom-routes-register_routes)
 - **WeCom integration**: an out-of-the-box long-connection option, @ it in a group to chat, can coexist with the external API
 - **Skills**: write business descriptions/terminology/FAQs as `bots/_skills/*.md`, let multiple Agents opt in,
   and once enabled they are spliced into the system prompt
@@ -141,7 +141,7 @@ passing Dify's current user as `user` and the conversation_id as `session_id`.
 
 Beyond the external API, an Agent can connect to WeCom: fill the `bot_id` / `secret` from the WeCom admin console into the config,
 start with `run`, and you can @ it in a group to chat. WeCom and the external API can be enabled at the same time, or you can use just one.
-See the [wecom section in the Configuration Reference](docs/配置参考.en.md#wecom--wecom-credentials).
+See the [wecom section in the Configuration Reference](docs/configuration-reference.md#wecom--wecom-credentials).
 
 ---
 

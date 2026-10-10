@@ -1,9 +1,9 @@
 # Configuration Reference
 
-<p align="right"><a href="配置参考.md">中文</a> | <a href="配置参考.en.md">English</a></p>
+<p align="right"><a href="配置参考.md">中文</a> | <a href="configuration-reference.md">English</a></p>
 
 A full field-by-field reference for `bot.yaml`, for lookup. For building an Agent for the
-first time, read the [Guide: Creating a New Agent](新建Bot步骤说明书.en.md) first.
+first time, read the [Guide: Creating a New Agent](creating-a-new-agent.md) first.
 
 When something is misconfigured, `python -m botkit validate <bot dir>` points out which field.
 **A misspelled field name errors out directly**, it is not silently ignored.

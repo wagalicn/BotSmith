@@ -1,6 +1,6 @@
 # Guide: Creating a New Agent
 
-<p align="right"><a href="新建Bot步骤说明书.md">中文</a> | <a href="新建Bot步骤说明书.en.md">English</a></p>
+<p align="right"><a href="新建Bot步骤说明书.md">中文</a> | <a href="creating-a-new-agent.md">English</a></p>
 
 Follow along and you'll build a working WeCom (WeChat Work) Agent. **No Python code needed the whole way.**
 
@@ -11,7 +11,7 @@ The main path uses the visual config page (just point and click). Under each ste
 - You need to be able to: fill in forms, copy and paste
 - You don't need to know: Python, YAML, the MCP protocol
 
-For the detailed meaning of each field, see the [Configuration Reference](配置参考.en.md).
+For the detailed meaning of each field, see the [Configuration Reference](configuration-reference.md).
 
 ---
 
@@ -528,7 +528,7 @@ Look up by symptom:
 | preview test errors | [Step 9](#step-9-preview-and-test-online) |
 | reply "an error occurred while processing" | [Step 10](#step-10-start-it-and-verify-in-a-group) |
 | poor answer quality | [Step 7](#step-7-write-the-prompt) or [Step 9](#step-9-preview-and-test-online) |
-| want to change a specific behavior | [Configuration Reference](配置参考.en.md) |
+| want to change a specific behavior | [Configuration Reference](configuration-reference.md) |
 
 The two troubleshooting tools can be run on their own anytime, without affecting a running Agent:
 
@@ -557,7 +557,7 @@ Most changes are just point-and-click on the config page; save and restart the A
 | log verbosity | Other | `logging.level` |
 | add fixed replies like a help menu | (requires code) | `on_message` in `hooks.py` |
 | add business descriptions/terminology/FAQ | Skills | `skills` (docs in `bots/_skills/`, opt in) |
-| expose as an HTTP API for Dify/portal | External API | `api` (see [Configuration Reference](配置参考.en.md#api--external-api)) |
+| expose as an HTTP API for Dify/portal | External API | `api` (see [Configuration Reference](configuration-reference.md#api--external-api)) |
 | move to another environment / copy config | title bar "Export JSON" / sidebar "Import" | export has no secrets, add keys after import |
 | verify after a change | Preview test | — |
 | delete an Agent | title bar "Delete this Agent" | moved to `bots/.trash/`, recoverable |

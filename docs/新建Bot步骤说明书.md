@@ -1,6 +1,6 @@
 # 新建 Agent 步骤说明书
 
-<p align="right"><a href="新建Bot步骤说明书.md">中文</a> | <a href="新建Bot步骤说明书.en.md">English</a></p>
+<p align="right"><a href="新建Bot步骤说明书.md">中文</a> | <a href="creating-a-new-agent.md">English</a></p>
 
 照着做就能建出一个能用的企微 Agent。**全程不需要改 Python 代码。**
 
