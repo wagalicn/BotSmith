@@ -28,19 +28,9 @@ const state = {
   previews: {},      // 按 Agent 名存预览，切回来能恢复：name -> {history, turns, busy}
 };
 
-const TABS = [
-  { id: "secrets", label: "密钥" },
-  { id: "llm", label: "大模型" },
-  { id: "tools", label: "工具" },
-  { id: "identity", label: "身份与安全" },
-  { id: "prompt", label: "提示词" },
-  { id: "skills", label: "技能" },
-  { id: "session", label: "会话" },
-  { id: "messages", label: "文案" },
-  { id: "intercepts", label: "前置拦截" },
-  { id: "api", label: "对外接口" },
-  { id: "preview", label: "预览测试" },
-  { id: "advanced", label: "其他" },
+const TAB_IDS = [
+  "secrets", "llm", "tools", "identity", "prompt", "skills",
+  "session", "messages", "intercepts", "api", "preview", "advanced",
 ];
 
 // ---------------------------------------------------------------- 工具函数
@@ -87,7 +77,8 @@ function setPath(obj, path, value) {
 }
 
 async function api(method, url, body) {
-  const options = { method, headers: {} };
+  // 带上当前界面语言，让后端（校验报错 / 配置摘要）按同一语言返回
+  const options = { method, headers: { "Accept-Language": getLang() === "en" ? "en" : "zh" } };
   if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
@@ -97,9 +88,9 @@ async function api(method, url, body) {
   try {
     payload = await response.json();
   } catch {
-    throw new Error(`服务端返回了非 JSON 内容（HTTP ${response.status}）`);
+    throw new Error(t("api.non_json", { status: response.status }));
   }
-  if (!response.ok) throw new Error(payload?.error || `请求失败（HTTP ${response.status}）`);
+  if (!response.ok) throw new Error(payload?.error || t("api.req_fail", { status: response.status }));
   return payload;
 }
 
@@ -111,7 +102,7 @@ function setStatus(text, kind = "") {
 
 function markDirty() {
   state.dirty = true;
-  setStatus("有未保存的改动", "busy");
+  setStatus(t("status.dirty"), "busy");
 }
 
 function note(kind, text) {
@@ -138,6 +129,19 @@ function textField({ path, label, note: noteText, placeholder, narrow, type = "t
     },
   });
   return wrap(input, label, noteText);
+}
+
+/**
+ * 取后端 options 某组，经 i18n 翻译后给 selectField 用。
+ * identity_presets 用 value 作键，其余用 value 作键（都是稳定标识）。
+ */
+function optionChoices(group) {
+  const raw = state.options[group] || [];
+  return raw.map((item) => {
+    const id = item.value !== undefined ? item.value : item.key;
+    const tr = translateOption(group, id, item);
+    return { value: item.value, label: tr.label, note: tr.note };
+  });
 }
 
 function selectField({ path, label, note: noteText, choices, fallback }) {
@@ -192,7 +196,7 @@ function renderSidebar() {
   list.replaceChildren();
 
   if (!state.bots.length) {
-    list.append(el("li", { class: "empty-list", text: "还没有 Agent，点「新建」" }));
+    list.append(el("li", { class: "empty-list", text: t("sidebar.empty") }));
     return;
   }
 
@@ -201,7 +205,7 @@ function renderSidebar() {
       type: "button",
       class: "bot-item" + (bot.name === state.current ? " active" : ""),
       onclick: () => selectBot(bot.name),
-      title: bot.ok ? "配置正常" : bot.error,
+      title: bot.ok ? t("status.validate_ok") : bot.error,
     }, [
       el("span", { class: "dot " + (bot.ok ? "ok" : "bad") }),
       el("span", { text: bot.name }),
@@ -215,16 +219,16 @@ function renderSidebar() {
 function renderTabs() {
   const tabs = $("#tabs");
   tabs.replaceChildren();
-  for (const tab of TABS) {
+  for (const id of TAB_IDS) {
     tabs.append(
       el("button", {
         type: "button",
-        class: "tab" + (tab.id === state.activeTab ? " active" : ""),
+        class: "tab" + (id === state.activeTab ? " active" : ""),
         onclick: () => {
-          state.activeTab = tab.id;
+          state.activeTab = id;
           render();
         },
-        text: tab.label,
+        text: t("tab." + id),
       })
     );
   }
@@ -247,7 +251,7 @@ function updateWecomTestButtons() {
     const btn = $(id);
     if (!btn) continue;
     btn.disabled = !ready;
-    btn.title = ready ? "" : "请先在上方填写 WECHAT_BOT_ID 和 WECHAT_BOT_SECRET";
+    btn.title = ready ? "" : t("secrets.wecom_btn_hint");
   }
 }
 
@@ -256,7 +260,7 @@ function renderSecrets() {
   box.replaceChildren();
 
   if (!state.env.length) {
-    box.append(el("p", { class: "empty-list", text: "这个配置没有用到 ${} 占位符。" }));
+    box.append(el("p", { class: "empty-list", text: t("secrets.empty") }));
     return;
   }
 
@@ -279,23 +283,25 @@ function renderSecrets() {
     const field = wrap(input, item.key, envHint(item.key));
     if (!item.filled) {
       field.classList.add("invalid");
-      field.append(el("p", { class: "field-error", text: "还没填" }));
+      field.append(el("p", { class: "field-error", text: t("secrets.not_filled") }));
     }
     box.append(field);
   }
 }
 
-const ENV_HINTS = {
-  WECHAT_BOT_ID: "企微后台 → 智能机器人 → API模式 → 长连接",
-  WECHAT_BOT_SECRET: "同上，和 bot_id 一起给出",
-  LLM_API_URL: "用 openai 后端时填到 /v1 为止，不要带 /chat/completions",
-  LLM_API_KEY: "大模型平台的密钥",
-  LLM_MODEL: "模型名，如 qwen3.7-plus",
+// 环境变量的提示文案 —— 用 i18n key，zh/en 都在 i18n.js 的字典里
+const ENV_HINT_KEYS = {
+  WECHAT_BOT_ID: "env.WECHAT_BOT_ID",
+  WECHAT_BOT_SECRET: "env.WECHAT_BOT_SECRET",
+  LLM_API_URL: "env.LLM_API_URL",
+  LLM_API_KEY: "env.LLM_API_KEY",
+  LLM_MODEL: "env.LLM_MODEL",
   // MCP 地址不在这里 —— 它在「工具」页每个服务端旁边填
 };
 
 function envHint(key) {
-  return ENV_HINTS[key] || "";
+  const i18nKey = ENV_HINT_KEYS[key];
+  return i18nKey ? t(i18nKey) : "";
 }
 
 // ---------------------------------------------------------------- 大模型
@@ -306,42 +312,42 @@ function renderLlm() {
   box.replaceChildren(
     selectField({
       path: "llm.client",
-      label: "接口方式",
-      choices: state.options.llm_clients,
+      label: t("llm.client_label"),
+      choices: optionChoices("llm_clients"),
       fallback: "openai",
-      note: "不确定就用推荐的那个",
+      note: t("llm.client_note"),
     }),
     textField({
       path: "llm.api_url",
-      label: "接口地址（api_url）",
+      label: t("llm.url_label"),
       placeholder: "https://xxx.com/compatible-mode/v1",
-      note: "直接填明文，会存进本地 .env、不进 git。openai 后端填到 /v1 为止，不要带 /chat/completions",
+      note: t("llm.url_note"),
     }),
     textField({
       path: "llm.api_key",
-      label: "接口密钥（api_key）",
+      label: t("llm.key_label"),
       type: state.showSecrets ? "text" : "password",
-      note: "大模型平台的密钥。存进本地 .env、不进 git",
+      note: t("llm.key_note"),
     }),
     textField({
       path: "llm.model",
-      label: "模型（model）",
+      label: t("llm.model_label"),
       placeholder: "qwen3.7-plus",
-      note: "模型名，直接填明文。存进本地 .env、不进 git",
+      note: t("llm.model_note"),
     }),
     textField({
       path: "llm.timeout_seconds",
-      label: "单次请求超时（秒）",
+      label: t("llm.timeout_label"),
       type: "number",
       narrow: true,
-      note: "带工具调用的一轮对话会请求多次，总耗时可能是它的几倍",
+      note: t("llm.timeout_note"),
     }),
     textField({
       path: "llm.max_tool_rounds",
-      label: "最多连续调几轮工具",
+      label: t("llm.rounds_label"),
       type: "number",
       narrow: true,
-      note: "防止模型反复调工具打转。到上限会回「工具轮次用尽」的文案",
+      note: t("llm.rounds_note"),
     })
   );
 
@@ -351,7 +357,7 @@ function renderLlm() {
       el("button", {
         type: "button",
         class: "btn btn-ghost btn-small",
-        text: state.showSecrets ? "隐藏密钥明文" : "显示密钥明文",
+        text: state.showSecrets ? t("llm.hide_key") : t("llm.show_key"),
         onclick: () => {
           state.showSecrets = !state.showSecrets;
           render();
@@ -361,13 +367,7 @@ function renderLlm() {
   );
 
   if (client === "aiohttp") {
-    box.prepend(
-      note(
-        "warn",
-        "兼容模式下地址要填完整端点（含 /chat/completions）。" +
-          "这个模式没有自动重试，一般只在官方 SDK 报 pydantic 校验错时才用。"
-      )
-    );
+    box.prepend(note("warn", t("llm.aiohttp_warn")));
   }
 }
 
@@ -401,7 +401,7 @@ function renderServerList() {
   const servers = currentServers();
   if (!servers.length) {
     box.append(
-      el("p", { class: "empty-list", text: "还没有 MCP 服务端。点下面「添加」加一个。" })
+      el("p", { class: "empty-list", text: t("tools.no_servers") })
     );
     return;
   }
@@ -410,37 +410,26 @@ function renderServerList() {
     const card = el("div", { class: "server-card" });
 
     const head = el("div", { class: "server-card-head" }, [
-      el("strong", { text: `服务端 ${index + 1}` }),
+      el("strong", { text: t("tools.server_n", { n: index + 1 }) }),
       el("button", {
         type: "button",
         class: "btn btn-icon btn-danger",
-        text: "删除",
-        "aria-label": `删除服务端 ${server.name || index + 1}`,
-        title: "删除这个服务端",
+        text: t("tools.delete"),
+        "aria-label": t("tools.delete") + " " + (server.name || index + 1),
+        title: t("tools.delete_server_title"),
         onclick: () => removeServer(index),
       }),
     ]);
     card.append(head);
 
     card.append(
-      serverField(index, "name", "标识名", "自取，如 oa、crm。用于日志和工具归属", "narrow")
+      serverField(index, "name", t("tools.field_name_label"), t("tools.field_name_note"), "narrow")
     );
     card.append(
-      serverField(
-        index,
-        "address",
-        "地址",
-        "MCP 服务端 URL，如 https://your-host:8081/mcp。" +
-          "直接填明文即可 —— 它会存进本地 .env、不进 git。"
-      )
+      serverField(index, "address", t("tools.field_addr_label"), t("tools.field_addr_note"))
     );
     card.append(
-      serverField(
-        index,
-        "identity_header",
-        "身份透传头",
-        "把当前用户身份透传给服务端的请求头名。留空则不发。默认 X-MCP-Identity"
-      )
+      serverField(index, "identity_header", t("tools.field_header_label"), t("tools.field_header_note"))
     );
     card.append(renderServerHeaders(index));
 
@@ -452,15 +441,8 @@ function renderServerList() {
  *  值多是 token，保存时会落到本地 .env、不进 git、也不在密钥页显示。 */
 function renderServerHeaders(index) {
   const wrapEl = el("div", { class: "field server-headers" });
-  wrapEl.append(el("label", { class: "field-label", text: "额外请求头" }));
-  wrapEl.append(
-    el("p", {
-      class: "field-note",
-      text:
-        "服务端要求鉴权时填，比如头名 Authorization、值 Bearer xxx。" +
-        "值会存进本地 .env、不进 git。",
-    })
-  );
+  wrapEl.append(el("label", { class: "field-label", text: t("tools.extra_headers_label") }));
+  wrapEl.append(el("p", { class: "field-note", text: t("tools.extra_headers_note") }));
 
   const server = currentServers()[index] || {};
   const headers = server.headers && typeof server.headers === "object" ? server.headers : {};
@@ -478,7 +460,7 @@ function renderServerHeaders(index) {
       placeholder: "Authorization",
       autocomplete: "off",
       spellcheck: "false",
-      "aria-label": `请求头名（服务端 ${index + 1}，第 ${ri + 1} 行）`,
+      "aria-label": t("tools.extra_headers_label") + " " + (index + 1) + "-" + (ri + 1),
       oninput: (e) => {
         row.key = e.target.value;
         syncHeaderRows(index, entries);
@@ -490,7 +472,7 @@ function renderServerHeaders(index) {
       placeholder: "Bearer xxxxxxxx",
       autocomplete: "off",
       spellcheck: "false",
-      "aria-label": `请求头值（服务端 ${index + 1}，第 ${ri + 1} 行）`,
+      "aria-label": t("tools.extra_headers_label") + " value " + (index + 1) + "-" + (ri + 1),
       oninput: (e) => {
         row.value = e.target.value;
         syncHeaderRows(index, entries);
@@ -499,8 +481,8 @@ function renderServerHeaders(index) {
     const del = el("button", {
       type: "button",
       class: "btn btn-icon btn-danger",
-      text: "删除",
-      "aria-label": `删除请求头 ${row.key || ri + 1}`,
+      text: t("tools.delete"),
+      "aria-label": t("tools.delete") + " " + (row.key || ri + 1),
       onclick: () => {
         entries.splice(ri, 1);
         syncHeaderRows(index, entries);
@@ -513,7 +495,7 @@ function renderServerHeaders(index) {
   const addBtn = el("button", {
     type: "button",
     class: "btn btn-small",
-    text: "＋ 添加请求头",
+    text: t("tools.add_header"),
     onclick: () => {
       entries.push({ key: "", value: "" });
       syncHeaderRows(index, entries);
@@ -556,7 +538,7 @@ function serverField(index, key, label, note, extraClass) {
           : "",
     autocomplete: "off",
     spellcheck: "false",
-    "aria-label": `${label}（服务端 ${index + 1}）`,
+    "aria-label": `${label} (${index + 1})`,
     oninput: (e) => {
       const s = currentServers()[index];
       if (!s) return;
@@ -586,7 +568,7 @@ function removeServer(index) {
   const servers = currentServers();
   // 允许删光所有服务端 —— 不接工具就是纯 LLM 对话 bot
   const removed = servers[index];
-  if (!confirm(`删除服务端「${removed?.name || index + 1}」？它勾选的工具也会一起去掉。`)) {
+  if (!confirm(t("tools.confirm_delete_server", { name: removed?.name || index + 1 }))) {
     return;
   }
   servers.splice(index, 1);
@@ -606,13 +588,13 @@ function renderToolPicker() {
     const block = el("div", { class: "server-block" });
     block.append(
       el("div", { class: "server-block-head" }, [
-        el("h4", { text: `服务端：${server.name || "(未命名)"}` }),
+        el("h4", { text: t("tools.server_colon", { name: server.name || t("tools.unnamed") }) }),
         el("button", {
           type: "button",
           class: "btn btn-small",
-          text: "只探测这个",
+          text: t("tools.probe_only_this"),
           disabled: !server.name,
-          title: server.name ? "" : "先填标识名",
+          title: server.name ? "" : t("tools.probe_only_need_name"),
           onclick: () => probeMcp(server.name),
         }),
       ])
@@ -623,12 +605,12 @@ function renderToolPicker() {
 
     if (!probed) {
       block.append(
-        el("p", { class: "hint", text: "还没探测。已配置的白名单：" })
+        el("p", { class: "hint", text: t("tools.not_probed") })
       );
       block.append(
         allow.length
           ? el("p", { class: "mono", text: allow.join("、") })
-          : el("p", { class: "empty-list", text: "（空 = 全部工具都给模型）" })
+          : el("p", { class: "empty-list", text: t("tools.allow_empty") })
       );
       box.append(block);
       continue;
@@ -641,20 +623,20 @@ function renderToolPicker() {
     const allChecked = probed.length > 0 && probed.every((t) => allow.includes(t.name));
     block.append(
       el("div", { class: "tool-toolbar" }, [
-        el("span", { class: "hint", text: `服务端提供 ${probed.length} 个，已勾选 ${allow.length} 个` }),
+        el("span", { class: "hint", text: t("tools.provide_selected", { total: probed.length, count: allow.length }) }),
         el("button", {
           type: "button",
           class: "btn btn-small",
-          text: "全选",
+          text: t("tools.select_all"),
           disabled: allChecked,
           onclick: () => {
-            setServerAllow(index, probed.map((t) => t.name));
+            setServerAllow(index, probed.map((tool) => tool.name));
           },
         }),
         el("button", {
           type: "button",
           class: "btn btn-small",
-          text: "全不选",
+          text: t("tools.select_none"),
           disabled: allow.length === 0,
           onclick: () => {
             setServerAllow(index, []);
@@ -664,12 +646,7 @@ function renderToolPicker() {
     );
 
     if (missing.length) {
-      block.append(
-        note(
-          "warn",
-          `配置里这些工具服务端上没有，可能是拼错或中台改名了：${missing.join("、")}`
-        )
-      );
+      block.append(note("warn", t("tools.missing_tools", { names: missing.join("、") })));
     }
 
     const list = el("div", { class: "tool-list" });
@@ -694,14 +671,14 @@ function renderToolPicker() {
         ? tool.params
             .map((p) => p.name + (p.required ? "*" : ""))
             .join(", ")
-        : "无参数";
+        : t("tools.no_params");
       list.append(
         el("div", { class: "tool-row" }, [
           checkbox,
           el("label", { for: checkbox.id }, [
             el("div", { class: "tool-name", text: tool.name }),
-            el("div", { class: "tool-desc", text: tool.description || "（这个工具没写描述，模型会不太好选）" }),
-            el("div", { class: "tool-params", text: "参数：" + params }),
+            el("div", { class: "tool-desc", text: tool.description || t("tools.no_desc") }),
+            el("div", { class: "tool-params", text: t("tools.params_prefix", { params }) }),
           ]),
         ])
       );
@@ -732,7 +709,7 @@ function allProbedTools() {
 
 function renderIdentity() {
   const box = $("#identity-fields");
-  const presets = state.options.identity_presets;
+  const presets = optionChoices("identity_presets");
   const pattern = getPath(state.values, "identity.pattern", "") ?? "";
   const known = presets.some((p) => p.value === pattern);
 
@@ -758,31 +735,26 @@ function renderIdentity() {
     el("option", {
       value: "__custom__",
       selected: !known,
-      text: "自定义正则…",
+      text: t("identity.custom_regex_option"),
     })
   );
 
   box.replaceChildren(
     selectField({
       path: "identity.source",
-      label: "怎么确定「是谁在说话」",
-      choices: state.options.identity_sources,
+      label: t("identity.source_label"),
+      choices: optionChoices("identity_sources"),
       fallback: "wecom_userid",
     }),
-    wrap(
-      presetSelect,
-      "工号格式校验",
-      "格式不符的人会被直接拒绝，不会进模型也不会碰工具。不确定就先选「不校验」，" +
-        "用密钥页的「等我 @ 一句话」看清真实工号长什么样再回来配。"
-    )
+    wrap(presetSelect, t("identity.pattern_label"), t("identity.pattern_note"))
   );
 
   if (!known) {
     box.append(
       textField({
         path: "identity.pattern",
-        label: "自定义正则",
-        note: "Python 正则语法，例如 ^[LM]\\d{6}$",
+        label: t("identity.custom_regex_label"),
+        note: t("identity.custom_regex_note"),
       })
     );
   }
@@ -802,16 +774,11 @@ function renderInjectRows() {
   const rows = currentInject();
   const tools = allProbedTools();
   const hint = $("#inject-hint");
-  hint.textContent = tools.length
-    ? ""
-    : "先去「工具」页点探测，这里就能直接从真实参数里选";
+  hint.textContent = tools.length ? "" : t("identity.inject_hint_probe");
 
   if (!rows.length) {
     box.append(
-      el("p", {
-        class: "empty-list",
-        text: "还没有绑定。如果工具里有「提交人」「申请人」这类参数，强烈建议加一条。",
-      })
+      el("p", { class: "empty-list", text: t("identity.inject_empty") })
     );
   }
 
@@ -823,7 +790,7 @@ function renderInjectRows() {
       : [row.arg].filter(Boolean);
 
     const toolSelect = el("select", {
-      "aria-label": "工具",
+      "aria-label": t("identity.tool_aria"),
       onchange: (e) => {
         row.tool = e.target.value;
         const tool = tools.find((t) => t.name === row.tool);
@@ -837,10 +804,10 @@ function renderInjectRows() {
     for (const name of toolNames) {
       toolSelect.append(el("option", { value: name, selected: name === row.tool, text: name }));
     }
-    if (!row.tool) toolSelect.prepend(el("option", { value: "", selected: true, text: "选一个工具…" }));
+    if (!row.tool) toolSelect.prepend(el("option", { value: "", selected: true, text: t("identity.pick_tool") }));
 
     const argSelect = el("select", {
-      "aria-label": "参数",
+      "aria-label": t("identity.arg_aria"),
       onchange: (e) => {
         row.arg = e.target.value;
         markDirty();
@@ -849,19 +816,19 @@ function renderInjectRows() {
     for (const name of argNames) {
       argSelect.append(el("option", { value: name, selected: name === row.arg, text: name }));
     }
-    if (!row.arg) argSelect.prepend(el("option", { value: "", selected: true, text: "选一个参数…" }));
+    if (!row.arg) argSelect.prepend(el("option", { value: "", selected: true, text: t("identity.pick_arg") }));
 
     box.append(
       el("div", { class: "inject-row" }, [
         toolSelect,
-        el("span", { class: "arrow", text: "的参数" }),
+        el("span", { class: "arrow", text: t("identity.inject_mid") }),
         argSelect,
-        el("span", { class: "arrow", text: "= 当前用户" }),
+        el("span", { class: "arrow", text: t("identity.inject_tail") }),
         el("button", {
           type: "button",
           class: "btn btn-icon",
-          "aria-label": "删除这条绑定",
-          text: "删除",
+          "aria-label": t("identity.inject_delete"),
+          text: t("identity.inject_delete"),
           onclick: () => {
             currentInject().splice(index, 1);
             markDirty();
@@ -891,8 +858,10 @@ function renderPrompt() {
 }
 
 function updatePromptMeta() {
-  $("#prompt-meta").textContent =
-    `${state.prompt.length} 字 · 保存到 ${getPath(state.values, "prompt.file", "prompt.md")}`;
+  $("#prompt-meta").textContent = t("prompt.meta", {
+    chars: state.prompt.length,
+    file: getPath(state.values, "prompt.file", "prompt.md"),
+  });
 }
 
 /** 极简 Markdown 渲染：够看提示词排版就行，不追求完整规范 */
@@ -968,7 +937,7 @@ function renderPromptPreview() {
   const text = state.prompt.trim();
   box.innerHTML = text
     ? renderMarkdown(state.prompt)
-    : '<p class="empty-list">还没写提示词。左边写点东西，这里会实时预览。</p>';
+    : `<p class="empty-list">${t("prompt.empty_preview")}</p>`;
 }
 
 let _promptCheckTimer = null;
@@ -995,9 +964,22 @@ function renderPromptCheck(report) {
   box.append(
     el("p", {
       class: "check-score",
-      text: `结构完整度 ${report.score}/${report.total} · 共 ${report.char_count} 字`,
+      text: t("prompt.check_score", { score: report.score, total: report.total, chars: report.char_count }),
     })
   );
+
+  // 后端 item 有稳定 key（role/task/reply/flow/constraint）；用它查 i18n，
+  // 没有对应翻译键时回退到后端返回的原始 label/hint。
+  const itemLabel = (item) => {
+    const k = "check." + item.key + ".label";
+    const v = t(k);
+    return v === k ? item.label : v;
+  };
+  const itemHint = (item) => {
+    const k = "check." + item.key + ".hint";
+    const v = t(k);
+    return v === k ? item.hint : v;
+  };
 
   const list = el("ul", { class: "check-list" });
   for (const item of report.items) {
@@ -1005,22 +987,44 @@ function renderPromptCheck(report) {
       el("li", { class: item.ok ? "ok" : "todo" }, [
         el("span", { class: "check-mark", text: item.ok ? "✓" : "○" }),
         el("span", {}, [
-          el("strong", { text: item.label }),
-          item.ok ? null : el("span", { class: "check-hint", text: " —— " + item.hint }),
+          el("strong", { text: itemLabel(item) }),
+          item.ok ? null : el("span", { class: "check-hint", text: " —— " + itemHint(item) }),
         ]),
       ])
     );
   }
   box.append(list);
 
-  if (report.suggestions.length) {
-    box.append(el("p", { class: "check-tip-title", text: "可以再补充：" }));
+  // suggestions 在前端按当前语言生成（复刻后端 prompt_check 的判断逻辑），
+  // 这样英文界面下建议也是英文。后端返回的中文 suggestions 不再直接使用。
+  const suggestions = buildPromptSuggestions(report, itemLabel, itemHint);
+  if (suggestions.length) {
+    box.append(el("p", { class: "check-tip-title", text: t("prompt.check_can_add") }));
     const tips = el("ul", { class: "check-tips" });
-    for (const s of report.suggestions) tips.append(el("li", { text: s }));
+    for (const s of suggestions) tips.append(el("li", { text: s }));
     box.append(tips);
   } else {
-    box.append(note("ok", "结构挺完整了。真正好不好用，去「预览测试」里聊两句看看。"));
+    box.append(note("ok", t("prompt.check_ok")));
   }
+}
+
+/** 按当前语言生成提示词结构建议，逻辑对齐后端 prompt_check.analyze_prompt */
+function buildPromptSuggestions(report, itemLabel, itemHint) {
+  const out = [];
+  if (report.char_count === 0) {
+    out.push(t("check.sug.empty"));
+  } else if (report.char_count < 60) {
+    out.push(t("check.sug.short"));
+  }
+  if (report.char_count > 0 && !report.heading_count) {
+    out.push(t("check.sug.no_heading"));
+  }
+  for (const item of report.items) {
+    if (!item.ok) {
+      out.push(t("check.sug.missing", { label: itemLabel(item), hint: itemHint(item) }));
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- 会话
@@ -1029,23 +1033,23 @@ function renderSession() {
   $("#session-fields").replaceChildren(
     selectField({
       path: "session.scope",
-      label: "谁跟谁共享对话上下文",
-      choices: state.options.session_scopes,
+      label: t("session.scope_label"),
+      choices: optionChoices("session_scopes"),
       fallback: "group_user",
     }),
     textField({
       path: "session.max_turns",
-      label: "记住最近几轮",
+      label: t("session.max_turns_label"),
       type: "number",
       narrow: true,
-      note: "1 轮 = 一问一答。调大会让每次请求携带的历史变长，token 成本上升",
+      note: t("session.max_turns_note"),
     }),
     textField({
       path: "session.ttl_seconds",
-      label: "多久没说话就忘掉（秒）",
+      label: t("session.ttl_label"),
       type: "number",
       narrow: true,
-      note: "1800 = 半小时",
+      note: t("session.ttl_note"),
     })
   );
 }
@@ -1056,11 +1060,12 @@ function renderMessages() {
   const box = $("#message-fields");
   box.replaceChildren();
   for (const field of state.options.message_fields) {
+    const tr = translateOption("message_fields", field.key, field);
     box.append(
       textareaField({
         path: "messages." + field.key,
-        label: field.label,
-        note: field.note,
+        label: tr.label,
+        note: tr.note,
         rows: 2,
       })
     );
@@ -1085,7 +1090,7 @@ function renderKeywords() {
         el("input", {
           type: "text",
           value: word,
-          "aria-label": `重置关键词 ${index + 1}`,
+          "aria-label": t("messages.keywords_h3") + " " + (index + 1),
           oninput: (e) => {
             words[index] = e.target.value;
             markDirty();
@@ -1094,8 +1099,8 @@ function renderKeywords() {
         el("button", {
           type: "button",
           class: "btn btn-icon",
-          text: "删除",
-          "aria-label": `删除关键词 ${word}`,
+          text: t("messages.delete"),
+          "aria-label": t("messages.delete") + " " + word,
           onclick: () => {
             words.splice(index, 1);
             markDirty();
@@ -1111,7 +1116,7 @@ function renderKeywords() {
       el("button", {
         type: "button",
         class: "btn btn-small",
-        text: "添加关键词",
+        text: t("messages.add_keyword"),
         onclick: () => {
           words.push("");
           markDirty();
@@ -1128,17 +1133,17 @@ function renderProgress() {
 
   let progress = getPath(state.values, "messages.tool_progress", null);
   if (typeof progress !== "object" || progress === null) {
-    progress = { default: "正在调用工具..." };
+    progress = {};
     setPath(state.values, "messages.tool_progress", progress);
   }
 
-  const toolNames = allProbedTools().map((t) => t.name);
+  const toolNames = allProbedTools().map((tool) => tool.name);
   const entries = Object.entries(progress).filter(([k]) => k !== "default");
 
   for (const [tool, text] of entries) {
     const options = toolNames.length ? toolNames : [tool];
     const toolSelect = el("select", {
-      "aria-label": "工具名",
+      "aria-label": t("messages.progress_h3"),
       onchange: (e) => {
         const value = progress[tool];
         delete progress[tool];
@@ -1157,7 +1162,7 @@ function renderProgress() {
         el("input", {
           type: "text",
           value: text,
-          "aria-label": `${tool} 的进度文案`,
+          "aria-label": tool,
           oninput: (e) => {
             progress[tool] = e.target.value;
             markDirty();
@@ -1166,8 +1171,8 @@ function renderProgress() {
         el("button", {
           type: "button",
           class: "btn btn-icon",
-          text: "删除",
-          "aria-label": `删除 ${tool} 的进度文案`,
+          text: t("messages.delete"),
+          "aria-label": t("messages.delete") + " " + tool,
           onclick: () => {
             delete progress[tool];
             markDirty();
@@ -1183,13 +1188,13 @@ function renderProgress() {
       el("input", {
         type: "text",
         value: progress.default ?? "",
-        "aria-label": "其他工具的默认进度文案",
+        "aria-label": t("messages.progress_default_hint"),
         oninput: (e) => {
           progress.default = e.target.value;
           markDirty();
         },
       }),
-      el("span", { class: "hint", text: "← 其他工具都用这句" }),
+      el("span", { class: "hint", text: t("messages.progress_default_hint") }),
     ])
   );
 
@@ -1200,7 +1205,7 @@ function renderProgress() {
         el("button", {
           type: "button",
           class: "btn btn-small",
-          text: "为某个工具单独写一句",
+          text: t("messages.progress_add_one"),
           onclick: () => {
             progress[unset[0]] = "";
             markDirty();
@@ -1232,7 +1237,7 @@ function renderIntercepts() {
 
   if (!rules.length) {
     box.append(
-      el("p", { class: "empty-list", text: "还没有拦截规则。点下面「添加规则」加一条。" })
+      el("p", { class: "empty-list", text: t("intercepts.empty") })
     );
   }
 
@@ -1241,12 +1246,12 @@ function renderIntercepts() {
 
     card.append(
       el("div", { class: "server-card-head" }, [
-        el("strong", { text: `规则 ${index + 1}` }),
+        el("strong", { text: t("intercepts.rule_n", { n: index + 1 }) }),
         el("button", {
           type: "button",
           class: "btn btn-icon btn-danger",
-          text: "删除",
-          "aria-label": `删除规则 ${index + 1}`,
+          text: t("intercepts.delete"),
+          "aria-label": t("intercepts.delete") + " " + (index + 1),
           onclick: () => {
             rules.splice(index, 1);
             markDirty();
@@ -1260,7 +1265,7 @@ function renderIntercepts() {
     const matchInput = el("input", {
       type: "text",
       value: (Array.isArray(rule.match) ? rule.match : []).join(", "),
-      placeholder: "帮助, help, ?",
+      placeholder: t("intercepts.match_placeholder"),
       oninput: (e) => {
         rule.match = e.target.value
           .split(/[,，]/)
@@ -1269,13 +1274,13 @@ function renderIntercepts() {
         markDirty();
       },
     });
-    card.append(wrap(matchInput, "关键词（精确匹配，逗号分隔）", "整条消息完全等于其中一个词才命中"));
+    card.append(wrap(matchInput, t("intercepts.match_label"), t("intercepts.match_note")));
 
     // 正则
     const regexInput = el("input", {
       type: "text",
       value: rule.match_regex ?? "",
-      placeholder: "^在吗[?？]?$",
+      placeholder: t("intercepts.regex_placeholder"),
       oninput: (e) => {
         const v = e.target.value.trim();
         if (v) rule.match_regex = v;
@@ -1283,12 +1288,12 @@ function renderIntercepts() {
         markDirty();
       },
     });
-    card.append(wrap(regexInput, "正则匹配（可选）", "命中子串即算。和关键词至少填一个"));
+    card.append(wrap(regexInput, t("intercepts.regex_label"), t("intercepts.regex_note")));
 
     // 回复
     const replyArea = el("textarea", {
       rows: 3,
-      placeholder: "命中时 Agent 直接回这句话",
+      placeholder: t("intercepts.reply_placeholder"),
       oninput: (e) => {
         rule.reply = e.target.value;
         markDirty();
@@ -1298,7 +1303,7 @@ function renderIntercepts() {
     // —— <textarea> 会忽略 value 特性，只认 .value / 子文本节点，
     //    否则页面加载时命中回复显示为空，保存又把空值写回去（等于没生效）。
     replyArea.value = rule.reply ?? "";
-    card.append(wrap(replyArea, "命中后的回复", "支持多行"));
+    card.append(wrap(replyArea, t("intercepts.reply_label"), t("intercepts.reply_note")));
 
     box.append(card);
   }
@@ -1308,7 +1313,7 @@ function renderIntercepts() {
       el("button", {
         type: "button",
         class: "btn btn-small",
-        text: "添加规则",
+        text: t("intercepts.add_rule"),
         onclick: () => {
           currentIntercepts().push({ match: [], reply: "" });
           markDirty();
@@ -1325,10 +1330,10 @@ function renderAdvanced() {
   $("#advanced-fields").replaceChildren(
     selectField({
       path: "logging.level",
-      label: "日志详细程度",
+      label: t("advanced.log_label"),
       choices: state.options.log_levels.map((level) => ({
         value: level,
-        label: level + (level === "INFO" ? "（默认）" : level === "DEBUG" ? "（排查问题时用）" : ""),
+        label: level + (level === "INFO" ? t("advanced.log_default") : level === "DEBUG" ? t("advanced.log_debug") : ""),
       })),
       fallback: "INFO",
     })
@@ -1338,17 +1343,13 @@ function renderAdvanced() {
   box.replaceChildren();
   const hooks = state.hooks;
   if (!hooks || !hooks.exists) {
-    box.append(note("", "没有 hooks.py。绝大多数 Agent 不需要写代码。"));
+    box.append(note("", t("advanced.hooks_none")));
   } else if (hooks.error) {
-    box.append(note("bad", "hooks.py 加载失败：\n" + hooks.error));
+    box.append(note("bad", t("advanced.hooks_fail", { error: hooks.error })));
   } else if (!hooks.implemented.length) {
-    box.append(
-      note("", `${hooks.file} 里所有扩展点都是注释状态，当前不生效。这是正常的。`)
-    );
+    box.append(note("", t("advanced.hooks_commented", { file: hooks.file })));
   } else {
-    box.append(
-      note("ok", `${hooks.file} 已启用的扩展点：${hooks.implemented.join("、")}`)
-    );
+    box.append(note("ok", t("advanced.hooks_active", { file: hooks.file, list: hooks.implemented.join("、") })));
   }
 }
 
@@ -1367,7 +1368,7 @@ function render() {
   $("#bot-title").textContent = state.current;
   $("#btn-delete").hidden = false;
   $("#run-hint").textContent = `python -m botkit run bots/${state.current}`;
-  $("#btn-toggle-secrets").textContent = state.showSecrets ? "隐藏明文" : "显示明文";
+  $("#btn-toggle-secrets").textContent = state.showSecrets ? t("secrets.toggle_hide") : t("secrets.toggle_show");
 
   renderSidebar();
   renderTabs();
@@ -1409,34 +1410,27 @@ function renderApi() {
     el("div", { class: "row" }, [
       toggle,
       el("label", { for: "api-enabled", style: "font-weight:600;margin:0" }, [
-        el("span", { text: "开启对外 chat 接口" }),
+        el("span", { text: t("api.enable") }),
       ]),
     ])
   );
-  box.append(
-    el("p", {
-      class: "desc",
-      text:
-        "开启后，运行 Agent 时会同时起一个 HTTP 服务，暴露 POST /chat 供 Dify " +
-        "或自研门户调用。也可以只启动这个接口、不连企业微信（见下方启动说明）。",
-    })
-  );
+  box.append(el("p", { class: "desc", text: t("api.enable_desc") }));
 
   box.append(
     textField({
       path: "api.port",
-      label: "监听端口",
+      label: t("api.port_label"),
       type: "number",
       narrow: true,
-      note: "chat 接口监听的端口，默认 9000。多个 bot 同机部署时各用不同端口",
+      note: t("api.port_note"),
     })
   );
   box.append(
     textField({
       path: "api.token",
-      label: "鉴权 token（API Key）",
+      label: t("api.token_label"),
       type: state.showSecrets ? "text" : "password",
-      note: "调用方需在请求头带 Authorization: Bearer <token>。留空 = 不鉴权（仅限可信内网）。存进本地 .env、不进 git",
+      note: t("api.token_note"),
     })
   );
   box.append(
@@ -1444,7 +1438,7 @@ function renderApi() {
       el("button", {
         type: "button",
         class: "btn btn-ghost btn-small",
-        text: state.showSecrets ? "隐藏 token 明文" : "显示 token 明文",
+        text: state.showSecrets ? t("api.hide_token") : t("api.show_token"),
         onclick: () => {
           state.showSecrets = !state.showSecrets;
           render();
@@ -1453,19 +1447,19 @@ function renderApi() {
     ])
   );
 
-  // 调用示例 + 启动说明
+  // 调用示例 + 启动说明（注释用英文占位，示例内容是技术文本，保持原样）
   const port = getPath(state.values, "api.port", 9000);
-  box.append(el("h3", { text: "怎么调用" }));
+  box.append(el("h3", { text: t("api.how_h3") }));
   const example = el("pre", { class: "summary" });
   example.textContent =
-    `# 启动（连企微 + 接口一起）:  python -m botkit run bots/${state.current}\n` +
-    `# 只启动接口（不连企微）:     python -m botkit serve-api bots/${state.current}\n\n` +
-    `POST http://<服务器IP>:${port}/chat\n` +
-    `Authorization: Bearer <你填的token>\n` +
+    `# run (WeCom + API together):  python -m botkit run bots/${state.current}\n` +
+    `# API only (no WeCom):         python -m botkit serve-api bots/${state.current}\n\n` +
+    `POST http://<server-ip>:${port}/chat\n` +
+    `Authorization: Bearer <your-token>\n` +
     `Content-Type: application/json\n\n` +
-    `{"message": "帮我查下报销进度", "user": "L220104", "session_id": "conv-1"}\n\n` +
-    `# 响应: {"reply": "...", "kind": "llm", "session_id": "conv-1"}\n` +
-    `# 探活: GET http://<服务器IP>:${port}/health`;
+    `{"message": "check my expense status", "user": "L220104", "session_id": "conv-1"}\n\n` +
+    `# response: {"reply": "...", "kind": "llm", "session_id": "conv-1"}\n` +
+    `# health:   GET http://<server-ip>:${port}/health`;
   box.append(example);
 }
 
@@ -1512,24 +1506,17 @@ function renderSkills() {
     el("div", { class: "row" }, [
       toggle,
       el("label", { for: "skills-enabled", style: "font-weight:600;margin:0" }, [
-        el("span", { text: "启用技能" }),
+        el("span", { text: t("skills.enable") }),
       ]),
     ])
   );
-  box.append(
-    el("p", {
-      class: "desc",
-      text:
-        "启用后，勾选的技能文档会拼进系统提示词，帮 Agent 理解业务说明、术语。" +
-        "文件放在共享目录 bots/_skills/，多个 Agent 可引用同一份。",
-    })
-  );
+  box.append(el("p", { class: "desc", text: t("skills.enable_desc") }));
 
   // 共享 skill 列表（复选引用 + 删除）
   const catalog = state.skillsCatalog || [];
   if (!catalog.length) {
     box.append(
-      el("p", { class: "empty-list", text: "共享目录还没有技能文件。用下面的按钮上传一个 .md。" })
+      el("p", { class: "empty-list", text: t("skills.empty") })
     );
   } else {
     const list = el("div", { class: "tool-list" });
@@ -1551,22 +1538,21 @@ function renderSkills() {
       const del = el("button", {
         type: "button",
         class: "btn btn-icon btn-danger",
-        text: "删除",
-        title: "从共享目录删除这个技能文件",
+        text: t("tools.delete"),
+        title: t("skills.delete_title"),
         onclick: () => deleteSkill(skill.name),
       });
+      const usage =
+        skill.used_by && skill.used_by.length
+          ? t("skills.chars_used", { chars: skill.chars, users: skill.used_by.join("、") })
+          : t("skills.chars_only", { chars: skill.chars });
       list.append(
         el("div", { class: "tool-row" }, [
           checkbox,
           el("label", { for: checkbox.id }, [
             el("div", { class: "tool-name", text: skill.name }),
-            el("div", { class: "tool-desc", text: skill.summary || "（空文件）" }),
-            el("div", {
-              class: "tool-params",
-              text:
-                `${skill.chars} 字` +
-                (skill.used_by && skill.used_by.length ? ` · 被 ${skill.used_by.join("、")} 引用` : ""),
-            }),
+            el("div", { class: "tool-desc", text: skill.summary || t("skills.empty_file") }),
+            el("div", { class: "tool-params", text: usage }),
           ]),
           del,
         ])
@@ -1580,21 +1566,19 @@ function renderSkills() {
   const known = new Set(catalog.map((s) => s.name));
   const stale = state.skillsLoaded ? files.filter((f) => !known.has(f)) : [];
   if (stale.length) {
-    box.append(
-      note("warn", "这些技能文件已经不在共享目录里了，但当前 Agent 还引用着，会导致校验失败。移除引用后记得保存。")
-    );
+    box.append(note("warn", t("skills.stale_warn")));
     const staleList = el("div", { class: "tool-list" });
     for (const fname of stale) {
       staleList.append(
         el("div", { class: "tool-row" }, [
           el("div", { style: "flex:1;min-width:0" }, [
             el("div", { class: "tool-name", text: fname }),
-            el("div", { class: "tool-desc", text: "文件不存在" }),
+            el("div", { class: "tool-desc", text: t("skills.file_missing") }),
           ]),
           el("button", {
             type: "button",
             class: "btn btn-small",
-            text: "移除引用",
+            text: t("skills.remove_ref"),
             onclick: () => removeSkillRef(fname),
           }),
         ])
@@ -1614,7 +1598,7 @@ function renderSkills() {
   const uploadBtn = el("button", {
     type: "button",
     class: "btn btn-small",
-    text: "＋ 上传技能 .md",
+    text: t("skills.upload"),
     onclick: () => fileInput.click(),
   });
   box.append(el("div", { class: "row", style: "margin-top:12px" }, [uploadBtn, fileInput]));
@@ -1631,13 +1615,13 @@ function uploadSkillFile(input) {
     try {
       const data = await api("POST", "/api/skills", { name, content });
       state.skillsCatalog = data.skills || [];
-      setStatus(`已上传技能 ${data.name}`, "ok");
+      setStatus(t("skills.uploaded", { name: data.name }), "ok");
       renderSkills();
     } catch (e) {
       setStatus(e.message, "bad");
     }
   };
-  reader.onerror = () => setStatus("读文件失败", "bad");
+  reader.onerror = () => setStatus(t("skills.read_fail"), "bad");
   reader.readAsText(file);
   input.value = "";
 }
@@ -1653,8 +1637,8 @@ async function deleteSkill(name) {
   const skill = (state.skillsCatalog || []).find((s) => s.name === name);
   const users = (skill && skill.used_by) || [];
   const question = users.length
-    ? `从共享目录删除技能「${name}」？\n\n这些 Agent 引用了它，会同时移除它们的引用：${users.join("、")}`
-    : `从共享目录删除技能「${name}」？\n\n目前没有 Agent 引用它。`;
+    ? t("skills.confirm_delete_used", { name, users: users.join("、") })
+    : t("skills.confirm_delete_unused", { name });
   if (!confirm(question)) {
     return;
   }
@@ -1679,11 +1663,9 @@ async function deleteSkill(name) {
       await revalidate();
     }
 
-    let message = `已删除技能 ${name}`;
-    if (cleaned.length) message += `，已从 ${cleaned.join("、")} 移除引用`;
-    if (skipped.length) {
-      message += `；${skipped.join("、")} 没能自动改写，请到对应 Agent 的「技能」页移除引用后保存`;
-    }
+    let message = t("skills.deleted", { name });
+    if (cleaned.length) message += t("skills.deleted_cleaned", { users: cleaned.join("、") });
+    if (skipped.length) message += t("skills.deleted_skipped", { users: skipped.join("、") });
     setStatus(message, skipped.length ? "bad" : "ok");
   } catch (e) {
     setStatus(e.message, "bad");
@@ -1699,7 +1681,7 @@ function renderPreview() {
 
   if (!state.preview.turns.length && !state.preview.busy) {
     box.append(
-      el("p", { class: "empty-list", text: "还没开始。下面输入一句话发送试试。" })
+      el("p", { class: "empty-list", text: t("preview.empty") })
     );
     return;
   }
@@ -1723,11 +1705,11 @@ function renderPreview() {
               el("span", { class: "tool-call-name", text: "🔧 " + call.tool }),
             ]),
             el("div", { class: "tool-call-body" }, [
-              el("div", { class: "tool-call-label", text: "参数" }),
+              el("div", { class: "tool-call-label", text: t("preview.args") }),
               el("pre", { text: JSON.stringify(call.args, null, 2) }),
-              el("div", { class: "tool-call-label", text: "返回" }),
+              el("div", { class: "tool-call-label", text: t("preview.result") }),
               el("pre", {
-                text: call.result + (call.truncated ? "\n…（已截断）" : ""),
+                text: call.result + (call.truncated ? t("preview.truncated") : ""),
               }),
             ]),
           ])
@@ -1739,7 +1721,7 @@ function renderPreview() {
   }
 
   if (state.preview.busy) {
-    box.append(el("div", { class: "chat-bubble bot busy", text: "正在思考…（真调 LLM 和工具，可能要几秒）" }));
+    box.append(el("div", { class: "chat-bubble bot busy", text: t("preview.thinking") }));
   }
 
   box.scrollTop = box.scrollHeight;
@@ -1752,7 +1734,7 @@ async function sendPreview() {
   if (!message) return;
 
   if (state.dirty) {
-    if (!confirm("有配置改动还没保存。预览用的是已保存的配置，未保存的改动不会生效。\n\n继续预览？")) {
+    if (!confirm(t("preview.confirm_dirty"))) {
       return;
     }
   }
@@ -1799,9 +1781,9 @@ async function loadBots() {
 }
 
 async function selectBot(name) {
-  if (state.dirty && !confirm("有改动还没保存，切换会丢掉。确定切换吗？")) return;
+  if (state.dirty && !confirm(t("confirm.switch_dirty"))) return;
 
-  setStatus("正在读取…", "busy");
+  setStatus(t("status.reading"), "busy");
   try {
     const data = await api("GET", `/api/bots/${encodeURIComponent(name)}`);
     state.current = data.name;
@@ -1836,19 +1818,19 @@ function clearProbeResults() {
 
 function applyValidation(validation) {
   if (!validation) return;
-  $("#summary").textContent = validation.summary || "（校验未通过，没有摘要）";
+  $("#summary").textContent = validation.summary || t("summary.none");
   if (validation.ok) {
-    setStatus("配置校验通过", "ok");
+    setStatus(t("status.validate_ok"), "ok");
     clearBanner();
   } else {
-    setStatus("配置有问题，看上方提示", "bad");
+    setStatus(t("status.validate_bad"), "bad");
     showBanner(validation.error);
   }
 }
 
 function showBanner(text) {
   clearBanner();
-  const banner = note("bad", "配置校验没通过：\n\n" + text);
+  const banner = note("bad", t("banner.validate_fail", { error: text }));
   banner.id = "validation-banner";
   $(".panels").prepend(banner);
 }
@@ -1875,7 +1857,7 @@ async function save() {
   if (!state.current) return;
   const button = $("#btn-save");
   button.disabled = true;
-  setStatus("正在保存…", "busy");
+  setStatus(t("status.saving"), "busy");
 
   const env = {};
   for (const item of state.env) env[item.key] = item.value;
@@ -1901,7 +1883,7 @@ async function save() {
 
 async function revalidate() {
   if (!state.current) return;
-  setStatus("正在校验…", "busy");
+  setStatus(t("status.validating"), "busy");
   try {
     applyValidation(
       await api("POST", `/api/bots/${encodeURIComponent(state.current)}/validate`)
@@ -1921,17 +1903,17 @@ async function probeMcp(serverName) {
   // 后端还按旧配置找，会报「配置里没有名叫 X 的 MCP 服务端」。
   // 所以有未保存改动时先落盘，保存失败（比如校验没过）就别往下探了。
   if (state.dirty) {
-    box.replaceChildren(note("busy", "检测到未保存的改动，正在先保存…"));
+    box.replaceChildren(note("busy", t("mcp.saving_first")));
     const ok = await save();
     if (!ok) {
-      box.replaceChildren(note("bad", "保存没成功，先按上面的提示把配置改对再探测。"));
+      box.replaceChildren(note("bad", t("mcp.save_fail")));
       return;
     }
   }
 
   button.disabled = true;
   box.replaceChildren(
-    note("busy", only ? `正在连接服务端「${only}」…` : "正在连接全部 MCP 服务端…")
+    note("busy", only ? t("mcp.connecting_one", { name: only }) : t("mcp.connecting_all"))
   );
 
   try {
@@ -1947,16 +1929,14 @@ async function probeMcp(serverName) {
     for (const server of result.servers) {
       if (server.ok) {
         state.probed[server.server] = server.tools;
-        box.append(
-          note("ok", `${server.server}：连通，拿到 ${server.tools.length} 个工具`)
-        );
+        box.append(note("ok", t("mcp.ok", { name: server.server, count: server.tools.length })));
       } else {
         delete state.probed[server.server];
-        box.append(note("bad", `${server.server} 连不上：\n${server.error}`));
+        box.append(note("bad", t("mcp.bad", { name: server.server, error: server.error })));
       }
     }
     box.append(
-      el("p", { class: "hint", text: `探测时使用的身份：${result.identity_used}` })
+      el("p", { class: "hint", text: t("mcp.identity_used", { identity: result.identity_used }) })
     );
     render();
   } catch (e) {
@@ -1971,12 +1951,7 @@ async function probeWecom(wait) {
   const box = $("#wecom-result");
   buttons.forEach((b) => (b.disabled = true));
   box.replaceChildren(
-    note(
-      "busy",
-      wait
-        ? "已连上，请现在切到企业微信，@ 这个 Agent 发一句话（最多等 90 秒）…"
-        : "正在连接企业微信…"
-    )
+    note("busy", wait ? t("wecom.waiting") : t("wecom.connecting"))
   );
 
   try {
@@ -1984,12 +1959,10 @@ async function probeWecom(wait) {
       "POST",
       `/api/bots/${encodeURIComponent(state.current)}/probe/wecom?wait=${wait ? 1 : 0}`
     );
-    box.replaceChildren(note("ok", "企微凭证正确，Agent 能连上。"));
+    box.replaceChildren(note("ok", t("wecom.cred_ok")));
 
     if (wait && result.timed_out) {
-      box.append(
-        note("warn", "等了 90 秒没收到消息。检查：Agent 在群里吗？群里发消息时 @ 它了吗？")
-      );
+      box.append(note("warn", t("wecom.timed_out")));
     } else if (result.message) {
       box.append(renderWecomMessage(result.message));
     }
@@ -2005,39 +1978,22 @@ function renderWecomMessage(info) {
   const list = el("dl", { class: "kv" });
   const add = (label, value) => {
     list.append(el("dt", { text: label }));
-    list.append(el("dd", { text: value === "" ? "（空）" : String(value) }));
+    list.append(el("dd", { text: value === "" ? t("wecom.kv_empty") : String(value) }));
   };
-  add("识别到的用户 ID", info.userid);
-  add("看起来像加密串吗", info.looks_encrypted ? "像（需要映射）" : "不像，是明文");
-  add("会话类型", info.chattype === "group" ? "群聊" : "单聊");
-  add("你说的话", info.content);
-  add("去掉 @ 之后", info.stripped);
-  add("会话隔离 key", info.session_key);
+  add(t("wecom.kv_userid"), info.userid);
+  add(t("wecom.kv_encrypted"), info.looks_encrypted ? t("wecom.encrypted_yes") : t("wecom.encrypted_no"));
+  add(t("wecom.kv_chattype"), info.chattype === "group" ? t("wecom.chat_group") : t("wecom.chat_single"));
+  add(t("wecom.kv_content"), info.content);
+  add(t("wecom.kv_stripped"), info.stripped);
+  add(t("wecom.kv_session"), info.session_key);
   box.append(list);
 
   if (info.identity_ok) {
-    box.append(
-      note("ok", "身份校验通过。这个用户能正常使用 Agent。")
-    );
+    box.append(note("ok", t("wecom.identity_ok")));
   } else if (info.looks_encrypted) {
-    box.append(
-      note(
-        "bad",
-        "身份校验不通过，而且这个 ID 像加密串。\n\n" +
-          "两条路：\n" +
-          "1）（推荐）让超管重建企微机器人，一般就能拿到明文工号；\n" +
-          "2）在 hooks.py 里实现 resolve_identity 做「加密 ID → 工号」的映射，" +
-          "并把身份来源改成「自定义」。"
-      )
-    );
+    box.append(note("bad", t("wecom.identity_encrypted")));
   } else {
-    box.append(
-      note(
-        "warn",
-        `身份校验不通过：${info.userid} 匹配不上 ${info.pattern}。\n` +
-          "这个 ID 看起来是明文的，多半是格式校验写严了 —— 去「身份与安全」页改一下。"
-      )
-    );
+    box.append(note("warn", t("wecom.identity_pattern", { userid: info.userid, pattern: info.pattern })));
   }
   return box;
 }
@@ -2050,7 +2006,7 @@ async function createBot() {
 
   error.textContent = "";
   if (!name) {
-    error.textContent = "请输入名字";
+    error.textContent = t("dialog.new_need_name");
     return;
   }
 
@@ -2061,7 +2017,7 @@ async function createBot() {
     await loadBots();
     state.dirty = false;
     await selectBot(result.name);
-    setStatus("已创建，先在「密钥」页填企微凭证和 MCP 地址", "busy");
+    setStatus(t("status.created"), "busy");
   } catch (e) {
     error.textContent = e.message;
   }
@@ -2070,16 +2026,11 @@ async function createBot() {
 async function deleteBot() {
   if (!state.current) return;
   const name = state.current;
-  if (
-    !confirm(
-      `确定删除 Agent「${name}」吗？\n\n` +
-        "它会被移到 bots/.trash/ 回收站，不是彻底删除，误删了可以从那里找回。"
-    )
-  ) {
+  if (!confirm(t("confirm.delete_bot", { name }))) {
     return;
   }
 
-  setStatus("正在删除…", "busy");
+  setStatus(t("status.deleting"), "busy");
   try {
     await api("DELETE", `/api/bots/${encodeURIComponent(name)}`);
     state.current = null;
@@ -2092,7 +2043,7 @@ async function deleteBot() {
     } else {
       render();
     }
-    setStatus(`已删除「${name}」（在回收站里可找回）`, "ok");
+    setStatus(t("status.deleted", { name }), "ok");
   } catch (e) {
     setStatus(e.message, "bad");
   }
@@ -2100,7 +2051,7 @@ async function deleteBot() {
 
 async function exportBot() {
   if (!state.current) return;
-  setStatus("正在导出…", "busy");
+  setStatus(t("status.exporting"), "busy");
   try {
     const data = await api("GET", `/api/bots/${encodeURIComponent(state.current)}/export`);
     const text = JSON.stringify(data, null, 2);
@@ -2111,7 +2062,7 @@ async function exportBot() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    setStatus("已导出 JSON（不含密钥值，导入后需在密钥页填）", "ok");
+    setStatus(t("status.exported"), "ok");
   } catch (e) {
     setStatus(e.message, "bad");
   }
@@ -2123,14 +2074,14 @@ async function submitImport() {
   const text = $("#import-text").value.trim();
   error.textContent = "";
   if (!text) {
-    error.textContent = "先粘贴 JSON 或选一个文件";
+    error.textContent = t("dialog.import_need_text");
     return;
   }
   let payload;
   try {
     payload = JSON.parse(text);
   } catch (e) {
-    error.textContent = "这不是合法的 JSON：" + e.message;
+    error.textContent = t("dialog.import_bad_json", { error: e.message });
     return;
   }
   try {
@@ -2140,7 +2091,7 @@ async function submitImport() {
     await loadBots();
     state.dirty = false;
     await selectBot(result.name);
-    setStatus("已导入，去「密钥」页填企微凭证和 MCP 地址/token", "busy");
+    setStatus(t("status.imported"), "busy");
   } catch (e) {
     error.textContent = e.message;
   }
@@ -2156,14 +2107,27 @@ function loadImportFile(input) {
     $("#import-error").textContent = "";
   };
   reader.onerror = () => {
-    $("#import-error").textContent = "读文件失败";
+    $("#import-error").textContent = t("dialog.import_read_fail");
   };
   reader.readAsText(file);
 }
 
 // ---------------------------------------------------------------- 启动
 
+/** 切换中/英：存偏好、重填静态 DOM、整页重渲染 */
+function toggleLang() {
+  setLang(getLang() === "zh" ? "en" : "zh");
+  applyStaticI18n();
+  render();
+  // 校验报错横幅和配置摘要来自后端，切语言后重新校验一次，让它们也跟着切语言
+  if (state.current && !state.dirty) {
+    revalidate();
+  }
+}
+
 async function init() {
+  applyStaticI18n();
+  $("#btn-lang").addEventListener("click", toggleLang);
   $("#btn-save").addEventListener("click", save);
   $("#btn-delete").addEventListener("click", deleteBot);
   $("#btn-validate").addEventListener("click", revalidate);
@@ -2258,7 +2222,7 @@ async function init() {
     if (state.bots.length) await selectBot(state.bots[0].name);
     else render();
   } catch (e) {
-    setStatus("初始化失败：" + e.message, "bad");
+    setStatus(t("status.init_fail", { error: e.message }), "bad");
   }
 }
 

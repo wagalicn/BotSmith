@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,37 @@ import yaml
 from dotenv import load_dotenv
 
 logger = logging.getLogger("botkit.config")
+
+# --------------------------------------------------------------------------
+# 报错/摘要的语言（给配置页面的英文界面用）
+#
+# 默认中文：CLI（botkit validate/run）和运行时不设置它，行为完全不变。
+# 只有配置页面在处理请求时，会按浏览器选的语言临时设成 "en"。
+# 用 ContextVar 而不是全局变量，异步/并发下各请求互不串台。
+# --------------------------------------------------------------------------
+_MESSAGE_LANG: ContextVar[str] = ContextVar("botkit_message_lang", default="zh")
+
+
+def set_message_lang(lang: str) -> object:
+    """设置当前上下文的报错语言（"zh" / "en"），返回 token 供 reset 用。"""
+    return _MESSAGE_LANG.set("en" if lang == "en" else "zh")
+
+
+def reset_message_lang(token: object) -> None:
+    """把语言恢复到 set 之前的值。"""
+    try:
+        _MESSAGE_LANG.reset(token)  # type: ignore[arg-type]
+    except (ValueError, LookupError):
+        pass
+
+
+def get_message_lang() -> str:
+    return _MESSAGE_LANG.get()
+
+
+def _m(zh: str, en: str) -> str:
+    """按当前语言选中文或英文消息。默认中文。"""
+    return en if _MESSAGE_LANG.get() == "en" else zh
 
 # ${VAR} 占位符
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -70,7 +102,7 @@ class WecomConfig:
 
 @dataclass
 class ApiConfig:
-    """对外 HTTP chat 接口（/chat）。用于对接 Dify 或自研门户。"""
+    """对外 HTTP chat 接口（/chat）。"""
 
     enabled: bool = False
     port: int = 9000
@@ -235,7 +267,10 @@ def _substitute_env(node: Any, path: str, missing: list[str]) -> Any:
 
         result = _ENV_PATTERN.sub(_replace, node)
         for var in found:
-            missing.append(f"{path} 引用了未定义的环境变量 ${{{var}}}")
+            missing.append(_m(
+                f"{path} 引用了未定义的环境变量 ${{{var}}}",
+                f"{path} references undefined environment variable ${{{var}}}",
+            ))
         return result
 
     if isinstance(node, dict):
@@ -261,16 +296,25 @@ def _as_dict(raw: Any, path: str) -> dict[str, Any]:
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        raise ConfigError(f"{path} 应该是一个对象（键值对），当前是 {type(raw).__name__}")
+        raise ConfigError(_m(
+            f"{path} 应该是一个对象（键值对），当前是 {type(raw).__name__}",
+            f"{path} should be an object (key-value pairs), but is {type(raw).__name__}",
+        ))
     return raw
 
 
 def _require_str(data: dict[str, Any], key: str, path: str) -> str:
     val = data.get(key)
     if val is None or (isinstance(val, str) and not val.strip()):
-        raise ConfigError(f"缺少必填配置 {path}.{key}（若是密钥，请检查 .env 里对应的变量是否已填）")
+        raise ConfigError(_m(
+            f"缺少必填配置 {path}.{key}（若是密钥，请检查 .env 里对应的变量是否已填）",
+            f"Missing required config {path}.{key} (if it's a secret, check the matching variable in .env)",
+        ))
     if not isinstance(val, str):
-        raise ConfigError(f"{path}.{key} 应该是字符串，当前是 {type(val).__name__}")
+        raise ConfigError(_m(
+            f"{path}.{key} 应该是字符串，当前是 {type(val).__name__}",
+            f"{path}.{key} should be a string, but is {type(val).__name__}",
+        ))
     return val.strip()
 
 
@@ -279,7 +323,10 @@ def _opt_str(data: dict[str, Any], key: str, path: str, default: str | None) -> 
         return default
     val = data[key]
     if not isinstance(val, str):
-        raise ConfigError(f"{path}.{key} 应该是字符串，当前是 {type(val).__name__}")
+        raise ConfigError(_m(
+            f"{path}.{key} 应该是字符串，当前是 {type(val).__name__}",
+            f"{path}.{key} should be a string, but is {type(val).__name__}",
+        ))
     val = val.strip()
     return val or None
 
@@ -289,9 +336,15 @@ def _opt_number(data: dict[str, Any], key: str, path: str, default: float) -> fl
         return default
     val = data[key]
     if isinstance(val, bool) or not isinstance(val, (int, float)):
-        raise ConfigError(f"{path}.{key} 应该是数字，当前是 {type(val).__name__}")
+        raise ConfigError(_m(
+            f"{path}.{key} 应该是数字，当前是 {type(val).__name__}",
+            f"{path}.{key} should be a number, but is {type(val).__name__}",
+        ))
     if val <= 0:
-        raise ConfigError(f"{path}.{key} 必须大于 0，当前是 {val}")
+        raise ConfigError(_m(
+            f"{path}.{key} 必须大于 0，当前是 {val}",
+            f"{path}.{key} must be greater than 0, but is {val}",
+        ))
     return float(val)
 
 
@@ -300,9 +353,15 @@ def _opt_int(data: dict[str, Any], key: str, path: str, default: int) -> int:
         return default
     val = data[key]
     if isinstance(val, bool) or not isinstance(val, int):
-        raise ConfigError(f"{path}.{key} 应该是整数，当前是 {type(val).__name__}")
+        raise ConfigError(_m(
+            f"{path}.{key} 应该是整数，当前是 {type(val).__name__}",
+            f"{path}.{key} should be an integer, but is {type(val).__name__}",
+        ))
     if val <= 0:
-        raise ConfigError(f"{path}.{key} 必须大于 0，当前是 {val}")
+        raise ConfigError(_m(
+            f"{path}.{key} 必须大于 0，当前是 {val}",
+            f"{path}.{key} must be greater than 0, but is {val}",
+        ))
     return val
 
 
@@ -311,11 +370,17 @@ def _opt_str_list(data: dict[str, Any], key: str, path: str) -> list[str]:
         return []
     val = data[key]
     if not isinstance(val, list):
-        raise ConfigError(f"{path}.{key} 应该是字符串列表，当前是 {type(val).__name__}")
+        raise ConfigError(_m(
+            f"{path}.{key} 应该是字符串列表，当前是 {type(val).__name__}",
+            f"{path}.{key} should be a list of strings, but is {type(val).__name__}",
+        ))
     out: list[str] = []
     for i, item in enumerate(val):
         if not isinstance(item, str):
-            raise ConfigError(f"{path}.{key}[{i}] 应该是字符串，当前是 {type(item).__name__}")
+            raise ConfigError(_m(
+                f"{path}.{key}[{i}] 应该是字符串，当前是 {type(item).__name__}",
+                f"{path}.{key}[{i}] should be a string, but is {type(item).__name__}",
+            ))
         item = item.strip()
         if item:
             out.append(item)
@@ -328,13 +393,22 @@ def _opt_str_dict(data: dict[str, Any], key: str, path: str) -> dict[str, str]:
         return {}
     val = data[key]
     if not isinstance(val, dict):
-        raise ConfigError(f"{path}.{key} 应该是键值对（字符串到字符串），当前是 {type(val).__name__}")
+        raise ConfigError(_m(
+            f"{path}.{key} 应该是键值对（字符串到字符串），当前是 {type(val).__name__}",
+            f"{path}.{key} should be key-value pairs (string to string), but is {type(val).__name__}",
+        ))
     out: dict[str, str] = {}
     for hk, hv in val.items():
         if not isinstance(hk, str) or not hk.strip():
-            raise ConfigError(f"{path}.{key} 里有个请求头名是空的或不是字符串")
+            raise ConfigError(_m(
+                f"{path}.{key} 里有个请求头名是空的或不是字符串",
+                f"{path}.{key} has a header name that is empty or not a string",
+            ))
         if not isinstance(hv, str):
-            raise ConfigError(f"{path}.{key}.{hk} 的值应该是字符串，当前是 {type(hv).__name__}")
+            raise ConfigError(_m(
+                f"{path}.{key}.{hk} 的值应该是字符串，当前是 {type(hv).__name__}",
+                f"The value of {path}.{key}.{hk} should be a string, but is {type(hv).__name__}",
+            ))
         out[hk.strip()] = hv
     return out
 
@@ -343,17 +417,19 @@ def _reject_unknown(data: dict[str, Any], allowed: set[str], path: str) -> None:
     unknown = sorted(set(data) - allowed)
     if unknown:
         hint = "、".join(sorted(allowed))
-        raise ConfigError(
-            f"{path} 下有无法识别的配置项：{'、'.join(unknown)}。"
-            f"可用的配置项是：{hint}"
-        )
+        hint_en = ", ".join(sorted(allowed))
+        raise ConfigError(_m(
+            f"{path} 下有无法识别的配置项：{'、'.join(unknown)}。可用的配置项是：{hint}",
+            f"{path} has unrecognized config keys: {', '.join(unknown)}. Allowed keys are: {hint_en}",
+        ))
 
 
 def _one_of(value: str, choices: tuple[str, ...], path: str) -> str:
     if value not in choices:
-        raise ConfigError(
-            f"{path} 只能是 {'、'.join(choices)} 之一，当前是 {value!r}"
-        )
+        raise ConfigError(_m(
+            f"{path} 只能是 {'、'.join(choices)} 之一，当前是 {value!r}",
+            f"{path} must be one of {', '.join(choices)}, but is {value!r}",
+        ))
     return value
 
 
@@ -391,7 +467,10 @@ def _parse_api(raw: Any) -> ApiConfig:
 def _parse_llm(raw: Any) -> LlmConfig:
     data = _as_dict(raw, "llm")
     if not data:
-        raise ConfigError("缺少必填配置段 llm（需要 api_url、api_key、model）")
+        raise ConfigError(_m(
+            "缺少必填配置段 llm（需要 api_url、api_key、model）",
+            "Missing required config section llm (needs api_url, api_key, model)",
+        ))
     _reject_unknown(
         data,
         {"client", "api_url", "api_key", "model", "timeout_seconds", "max_tool_rounds"},
@@ -402,12 +481,17 @@ def _parse_llm(raw: Any) -> LlmConfig:
 
     # openai 后端要的是 base_url（到 /v1 为止），填成 /chat/completions 会 404
     if client == "openai" and api_url.rstrip("/").endswith("/chat/completions"):
-        raise ConfigError(
+        fixed = api_url.rstrip("/")[: -len("/chat/completions")]
+        raise ConfigError(_m(
             "llm.client=openai 时，llm.api_url 应该填到 /v1 为止（不含 /chat/completions），"
             "官方 SDK 会自己拼接路径。当前值：" + api_url + "\n"
-            "  改成： " + api_url.rstrip("/")[: -len("/chat/completions")] + "\n"
-            "  或者把 llm.client 改成 aiohttp（裸 HTTP 后端接受完整 URL）"
-        )
+            "  改成： " + fixed + "\n"
+            "  或者把 llm.client 改成 aiohttp（裸 HTTP 后端接受完整 URL）",
+            "When llm.client=openai, llm.api_url should go up to /v1 (without /chat/completions); "
+            "the official SDK appends the path itself. Current value: " + api_url + "\n"
+            "  change to: " + fixed + "\n"
+            "  or set llm.client to aiohttp (the raw HTTP backend accepts a full URL)",
+        ))
 
     return LlmConfig(
         client=client,
@@ -423,20 +507,32 @@ def _parse_prompt(raw: Any, bot_dir: Path) -> tuple[str, str]:
     """返回 (提示词正文, 来源描述)"""
     data = _as_dict(raw, "prompt")
     if not data:
-        raise ConfigError("缺少必填配置段 prompt（用 file 指向提示词文件，或用 inline 直接写）")
+        raise ConfigError(_m(
+            "缺少必填配置段 prompt（用 file 指向提示词文件，或用 inline 直接写）",
+            "Missing required config section prompt (use file to point to a prompt file, or inline to write it directly)",
+        ))
     _reject_unknown(data, {"file", "inline"}, "prompt")
 
     has_file = bool(data.get("file"))
     has_inline = bool(data.get("inline"))
     if has_file and has_inline:
-        raise ConfigError("prompt.file 和 prompt.inline 只能配一个")
+        raise ConfigError(_m(
+            "prompt.file 和 prompt.inline 只能配一个",
+            "Only one of prompt.file and prompt.inline may be set",
+        ))
     if not has_file and not has_inline:
-        raise ConfigError("prompt 段需要 file 或 inline 其中之一")
+        raise ConfigError(_m(
+            "prompt 段需要 file 或 inline 其中之一",
+            "The prompt section needs either file or inline",
+        ))
 
     if has_inline:
         text = str(data["inline"]).strip()
         if not text:
-            raise ConfigError("prompt.inline 不能是空内容")
+            raise ConfigError(_m(
+                "prompt.inline 不能是空内容",
+                "prompt.inline cannot be empty",
+            ))
         return text, "inline"
 
     rel = str(data["file"]).strip()
@@ -447,10 +543,16 @@ def _parse_prompt(raw: Any, bot_dir: Path) -> tuple[str, str]:
 def _read_prompt_file(prompt_path: Path) -> str:
     """读提示词文件。启动加载和运行中热加载共用，读完即关闭文件。"""
     if not prompt_path.is_file():
-        raise ConfigError(f"prompt.file 指向的文件不存在：{prompt_path}")
+        raise ConfigError(_m(
+            f"prompt.file 指向的文件不存在：{prompt_path}",
+            f"The file pointed to by prompt.file does not exist: {prompt_path}",
+        ))
     text = prompt_path.read_text(encoding="utf-8").strip()
     if not text:
-        raise ConfigError(f"提示词文件是空的：{prompt_path}")
+        raise ConfigError(_m(
+            f"提示词文件是空的：{prompt_path}",
+            f"The prompt file is empty: {prompt_path}",
+        ))
     return text
 
 
@@ -492,10 +594,16 @@ def _skill_path(bot_dir: Path, fname: str) -> Path:
     """技能文件名 → 共享目录下的绝对路径。只允许纯文件名，防止 ../ 逃出共享目录"""
     sdir = skills_dir_for(bot_dir)
     if "/" in fname or "\\" in fname or fname.startswith("."):
-        raise ConfigError(f"skills.files 里的名字不合法：{fname}（只能是 _skills/ 下的文件名）")
+        raise ConfigError(_m(
+            f"skills.files 里的名字不合法：{fname}（只能是 _skills/ 下的文件名）",
+            f"Invalid name in skills.files: {fname} (must be a file name under _skills/)",
+        ))
     fpath = (sdir / fname).resolve()
     if not str(fpath).startswith(str(sdir.resolve())):
-        raise ConfigError(f"skills.files 里的名字越界了：{fname}")
+        raise ConfigError(_m(
+            f"skills.files 里的名字越界了：{fname}",
+            f"Name in skills.files escapes the shared directory: {fname}",
+        ))
     return fpath
 
 
@@ -511,7 +619,10 @@ def _read_skill_files(bot_dir: Path, files: list[str]) -> str:
     for fname in files:
         fpath = _skill_path(bot_dir, fname)
         if not fpath.is_file():
-            raise ConfigError(f"技能文件不存在：{fpath}（放到 {sdir} 下，或在页面上取消勾选）")
+            raise ConfigError(_m(
+                f"技能文件不存在：{fpath}（放到 {sdir} 下，或在页面上取消勾选）",
+                f"Skill file does not exist: {fpath} (put it under {sdir}, or uncheck it on the page)",
+            ))
         content = fpath.read_text(encoding="utf-8").strip()
         if content:
             parts.append(f"## {fname}\n\n{content}")
@@ -529,7 +640,10 @@ def _parse_mcp(raw: Any) -> McpConfig:
     if not servers_raw:
         return McpConfig(servers=[])
     if not isinstance(servers_raw, list):
-        raise ConfigError(f"mcp.servers 应该是列表，当前是 {type(servers_raw).__name__}")
+        raise ConfigError(_m(
+            f"mcp.servers 应该是列表，当前是 {type(servers_raw).__name__}",
+            f"mcp.servers should be a list, but is {type(servers_raw).__name__}",
+        ))
 
     servers: list[McpServerConfig] = []
     seen: set[str] = set()
@@ -548,7 +662,10 @@ def _parse_mcp(raw: Any) -> McpConfig:
         # 注意：直接读原始值判空，不走 _opt_str —— 后者对空串会返回 None。
         url_raw = sd.get("url")
         if url_raw is not None and not isinstance(url_raw, str):
-            raise ConfigError(f"{path}.url 应该是字符串，当前是 {type(url_raw).__name__}")
+            raise ConfigError(_m(
+                f"{path}.url 应该是字符串，当前是 {type(url_raw).__name__}",
+                f"{path}.url should be a string, but is {type(url_raw).__name__}",
+            ))
         url = (url_raw or "").strip()
         name_val = sd.get("name")
         name_raw = (name_val or "").strip() if isinstance(name_val, str) else ""
@@ -562,7 +679,10 @@ def _parse_mcp(raw: Any) -> McpConfig:
         # 填了 url 就必须有 name（要用于工具路由和日志）
         name = _require_str(sd, "name", path)
         if name in seen:
-            raise ConfigError(f"{path}.name 重复：{name}（每个 MCP 服务端的 name 要唯一）")
+            raise ConfigError(_m(
+                f"{path}.name 重复：{name}（每个 MCP 服务端的 name 要唯一）",
+                f"{path}.name is duplicated: {name} (each MCP server's name must be unique)",
+            ))
         seen.add(name)
         servers.append(
             McpServerConfig(
@@ -594,12 +714,18 @@ def _parse_identity(raw: Any) -> IdentityConfig:
         try:
             re.compile(pattern)
         except re.error as e:
-            raise ConfigError(f"identity.pattern 不是合法的正则表达式：{e}") from e
+            raise ConfigError(_m(
+                f"identity.pattern 不是合法的正则表达式：{e}",
+                f"identity.pattern is not a valid regular expression: {e}",
+            )) from e
 
     inject: list[IdentityInject] = []
     inject_raw = data.get("inject") or []
     if not isinstance(inject_raw, list):
-        raise ConfigError(f"identity.inject 应该是列表，当前是 {type(inject_raw).__name__}")
+        raise ConfigError(_m(
+            f"identity.inject 应该是列表，当前是 {type(inject_raw).__name__}",
+            f"identity.inject should be a list, but is {type(inject_raw).__name__}",
+        ))
     for i, item in enumerate(inject_raw):
         path = f"identity.inject[{i}]"
         idata = _as_dict(item, path)
@@ -663,9 +789,10 @@ def _parse_messages(raw: Any) -> MessagesConfig:
     elif isinstance(suffix_raw, str):
         kwargs["reply_suffix"] = suffix_raw
     else:
-        raise ConfigError(
-            f"messages.reply_suffix 应该是字符串，当前是 {type(suffix_raw).__name__}"
-        )
+        raise ConfigError(_m(
+            f"messages.reply_suffix 应该是字符串，当前是 {type(suffix_raw).__name__}",
+            f"messages.reply_suffix should be a string, but is {type(suffix_raw).__name__}",
+        ))
 
     if "reset_keywords" in data and data["reset_keywords"] is not None:
         kwargs["reset_keywords"] = _opt_str_list(data, "reset_keywords", "messages")
@@ -680,9 +807,10 @@ def _parse_messages(raw: Any) -> MessagesConfig:
         progress: dict[str, str] = {}
         for k, v in tp.items():
             if not isinstance(v, str):
-                raise ConfigError(
-                    f"messages.tool_progress.{k} 应该是字符串，当前是 {type(v).__name__}"
-                )
+                raise ConfigError(_m(
+                    f"messages.tool_progress.{k} 应该是字符串，当前是 {type(v).__name__}",
+                    f"messages.tool_progress.{k} should be a string, but is {type(v).__name__}",
+                ))
             progress[str(k)] = v
         progress.setdefault("default", defaults.tool_progress["default"])
         kwargs["tool_progress"] = progress
@@ -703,7 +831,10 @@ def _parse_intercepts(raw: Any) -> list[Intercept]:
     if raw is None:
         return []
     if not isinstance(raw, list):
-        raise ConfigError(f"intercepts 应该是列表，当前是 {type(raw).__name__}")
+        raise ConfigError(_m(
+            f"intercepts 应该是列表，当前是 {type(raw).__name__}",
+            f"intercepts should be a list, but is {type(raw).__name__}",
+        ))
 
     out: list[Intercept] = []
     for i, item in enumerate(raw):
@@ -716,14 +847,18 @@ def _parse_intercepts(raw: Any) -> list[Intercept]:
         match_regex = _opt_str(idata, "match_regex", path, None)
 
         if not match and not match_regex:
-            raise ConfigError(
-                f"{path} 至少要配 match（关键词列表）或 match_regex（正则）中的一个"
-            )
+            raise ConfigError(_m(
+                f"{path} 至少要配 match（关键词列表）或 match_regex（正则）中的一个",
+                f"{path} needs at least one of match (keyword list) or match_regex (regex)",
+            ))
         if match_regex is not None:
             try:
                 re.compile(match_regex)
             except re.error as e:
-                raise ConfigError(f"{path}.match_regex 不是合法的正则表达式：{e}") from e
+                raise ConfigError(_m(
+                    f"{path}.match_regex 不是合法的正则表达式：{e}",
+                    f"{path}.match_regex is not a valid regular expression: {e}",
+                )) from e
 
         out.append(Intercept(reply=reply, match=match, match_regex=match_regex))
     return out
@@ -772,9 +907,15 @@ def resolve_bot_dir(bot_dir: str | Path) -> Path:
     else:
         path = path.resolve()
     if not path.is_dir():
-        raise ConfigError(f"bot 目录不存在：{path}")
+        raise ConfigError(_m(
+            f"bot 目录不存在：{path}",
+            f"bot directory does not exist: {path}",
+        ))
     if not (path / "bot.yaml").is_file():
-        raise ConfigError(f"目录里没有 bot.yaml：{path}")
+        raise ConfigError(_m(
+            f"目录里没有 bot.yaml：{path}",
+            f"no bot.yaml in the directory: {path}",
+        ))
     return path
 
 
@@ -831,31 +972,46 @@ def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
     try:
         raw_text = config_path.read_text(encoding="utf-8")
     except OSError as e:
-        raise ConfigError(f"读不到配置文件 {config_path}：{e}") from e
+        raise ConfigError(_m(
+            f"读不到配置文件 {config_path}：{e}",
+            f"Cannot read config file {config_path}: {e}",
+        )) from e
 
     try:
         raw = yaml.safe_load(raw_text)
     except yaml.YAMLError as e:
-        raise ConfigError(f"{config_path} 不是合法的 YAML：{e}") from e
+        raise ConfigError(_m(
+            f"{config_path} 不是合法的 YAML：{e}",
+            f"{config_path} is not valid YAML: {e}",
+        )) from e
 
     if raw is None:
-        raise ConfigError(f"配置文件是空的：{config_path}")
+        raise ConfigError(_m(
+            f"配置文件是空的：{config_path}",
+            f"The config file is empty: {config_path}",
+        ))
     if not isinstance(raw, dict):
-        raise ConfigError(f"{config_path} 顶层应该是键值对，当前是 {type(raw).__name__}")
+        raise ConfigError(_m(
+            f"{config_path} 顶层应该是键值对，当前是 {type(raw).__name__}",
+            f"The top level of {config_path} should be key-value pairs, but is {type(raw).__name__}",
+        ))
 
     # 占位符替换：把所有缺失的环境变量一次性报出来
     missing: list[str] = []
     raw = _substitute_env(raw, "", missing)
     if missing:
         detail = "\n".join(f"  - {m}" for m in missing)
-        raise ConfigError(
+        raise ConfigError(_m(
             f"{config_path} 里有占位符没有对应的环境变量：\n{detail}\n"
-            f"请在 {path / '.env'} 里补上这些变量（可参考同目录的 .env.example）"
-        )
+            f"请在 {path / '.env'} 里补上这些变量（可参考同目录的 .env.example）",
+            f"{config_path} has placeholders without matching environment variables:\n{detail}\n"
+            f"Please add these variables in {path / '.env'} (see the .env.example in the same directory)",
+        ))
 
-    _reject_unknown(raw, _TOP_LEVEL_KEYS, "配置文件顶层")
+    _top = _m("配置文件顶层", "the top level of the config file")
+    _reject_unknown(raw, _TOP_LEVEL_KEYS, _top)
 
-    name = _require_str(raw, "name", "配置文件顶层").replace(" ", "-")
+    name = _require_str(raw, "name", _top).replace(" ", "-")
     prompt_text, prompt_source = _parse_prompt(raw.get("prompt"), path)
     skills_enabled, skills_files, skills_text = _parse_skills(raw.get("skills"), path)
     wecom = _parse_wecom(raw.get("wecom"))
@@ -864,11 +1020,14 @@ def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
     # 一个 bot 至少得有一种对外方式：连企微，或开 chat 接口。
     has_wecom = bool(wecom.bot_id and wecom.bot_secret)
     if not has_wecom and not api.enabled:
-        raise ConfigError(
+        raise ConfigError(_m(
             "这个 bot 既没填企微凭证、也没开对外接口 —— 至少要有一种：\n"
             "  - 在「密钥」页填企微 bot_id / bot_secret（连企微群使用），或\n"
-            "  - 在「对外接口」页开启 chat 接口（给 Dify / 门户调用）"
-        )
+            "  - 在「对外接口」页开启 chat 接口（给 Dify / 门户调用）",
+            "This bot has neither WeCom credentials nor an external API —— it needs at least one:\n"
+            "  - fill WeCom bot_id / bot_secret on the \"Keys\" tab (to use in WeCom groups), or\n"
+            "  - enable the chat API on the \"External API\" tab (for Dify / a portal)",
+        ))
 
     return BotConfig(
         name=name,
@@ -1005,7 +1164,13 @@ def mask_secret(value: str, keep: int = 4) -> str:
 
 
 def config_summary(cfg: BotConfig) -> str:
-    """人可读的配置摘要，密钥打码。给 `botkit validate` 用"""
+    """人可读的配置摘要，密钥打码。给 `botkit validate` 用。
+
+    默认中文（CLI/运行时）。配置页面英文界面下会按 Accept-Language 输出英文。
+    """
+    if get_message_lang() == "en":
+        return _config_summary_en(cfg)
+
     lines: list[str] = []
     lines.append(f"bot 名称         : {cfg.name}")
     lines.append(f"bot 目录         : {cfg.bot_dir}")
@@ -1093,4 +1258,96 @@ def config_summary(cfg: BotConfig) -> str:
     lines.append("")
     lines.append("[Hook]")
     lines.append(f"  文件           : {cfg.hooks_file or '(无)'}")
+    return "\n".join(lines)
+
+
+def _config_summary_en(cfg: BotConfig) -> str:
+    """config_summary 的英文版（配置页面英文界面用）。"""
+    lines: list[str] = []
+    lines.append(f"bot name        : {cfg.name}")
+    lines.append(f"bot directory   : {cfg.bot_dir}")
+    lines.append(f"log level       : {cfg.log_level}")
+    lines.append("")
+    lines.append("[WeCom]")
+    if cfg.has_wecom:
+        lines.append(f"  bot_id        : {mask_secret(cfg.wecom.bot_id)}")
+        lines.append(f"  bot_secret    : {mask_secret(cfg.wecom.bot_secret)}")
+    else:
+        lines.append("  (no WeCom credentials, not connecting to WeCom)")
+    lines.append("")
+    lines.append("[External API]")
+    if cfg.api.enabled:
+        lines.append(f"  chat API      : enabled, port {cfg.api.port}")
+        lines.append(f"  auth token    : {mask_secret(cfg.api.token) if cfg.api.token else '(no auth)'}")
+    else:
+        lines.append("  chat API      : disabled")
+    lines.append("")
+    lines.append("[LLM]")
+    lines.append(f"  backend       : {cfg.llm.client}")
+    lines.append(f"  api_url       : {cfg.llm.api_url}")
+    lines.append(f"  api_key       : {mask_secret(cfg.llm.api_key)}")
+    lines.append(f"  model         : {cfg.llm.model}")
+    lines.append(f"  timeout (s)   : {cfg.llm.timeout_seconds:g}")
+    lines.append(f"  max tool rounds: {cfg.llm.max_tool_rounds}")
+    lines.append("")
+    lines.append("[Prompt]")
+    lines.append(f"  source        : {cfg.prompt_source}")
+    lines.append(f"  length        : {len(cfg.prompt_text)} chars")
+    first_line = cfg.prompt_text.splitlines()[0] if cfg.prompt_text else ""
+    lines.append(f"  first line    : {first_line[:60]}")
+    lines.append("")
+    lines.append("[Skills]")
+    if cfg.skills_enabled and cfg.skills_files:
+        lines.append(f"  enabled       : yes ({len(cfg.skills_files)} files, {len(cfg.skills_text)} chars)")
+        lines.append(f"  files         : {', '.join(cfg.skills_files)}")
+    else:
+        lines.append("  enabled       : no")
+    lines.append("")
+    lines.append("[MCP servers]")
+    if not cfg.mcp.servers:
+        lines.append("  (none configured, pure LLM chat, no tools)")
+    for s in cfg.mcp.servers:
+        lines.append(f"  - {s.name}")
+        lines.append(f"      url       : {s.url}")
+        lines.append(f"      id header : {s.identity_header or '(not sent)'}")
+        if s.headers:
+            masked = ", ".join(f"{k}: {mask_secret(v)}" for k, v in s.headers.items())
+            lines.append(f"      extra hdrs: {masked}")
+        allow = ", ".join(s.allow_tools) if s.allow_tools else "(all open)"
+        lines.append(f"      allowlist : {allow}")
+        if s.deny_tools:
+            lines.append(f"      denylist  : {', '.join(s.deny_tools)}")
+    lines.append("")
+    lines.append("[Identity]")
+    lines.append(f"  source        : {cfg.identity.source}")
+    lines.append(f"  pattern       : {cfg.identity.pattern or '(not validated)'}")
+    if cfg.identity.inject:
+        for inj in cfg.identity.inject:
+            lines.append(f"  inject        : {inj.tool}.{inj.arg}")
+    else:
+        lines.append("  inject        : (none)")
+    lines.append("")
+    lines.append("[Session]")
+    lines.append(f"  scope         : {cfg.session.scope}")
+    lines.append(f"  max turns     : {cfg.session.max_turns}")
+    lines.append(f"  idle ttl (s)  : {cfg.session.ttl_seconds}")
+    lines.append("")
+    lines.append("[Copy]")
+    lines.append(f"  reset keywords: {', '.join(cfg.messages.reset_keywords) or '(none)'}")
+    lines.append(f"  tool progress : {len(cfg.messages.tool_progress)} entries")
+    suffix_preview = cfg.messages.reply_suffix.strip().replace("\n", " ")
+    lines.append(f"  reply suffix  : {suffix_preview[:40] if suffix_preview else '(none)'}")
+    lines.append("")
+    lines.append("[Intercepts]")
+    if cfg.intercepts:
+        for idx, rule in enumerate(cfg.intercepts, 1):
+            conds = list(rule.match)
+            if rule.match_regex:
+                conds.append(f"regex:{rule.match_regex}")
+            lines.append(f"  rule {idx}       : {', '.join(conds)}")
+    else:
+        lines.append("  (none, all messages go to the LLM)")
+    lines.append("")
+    lines.append("[Hook]")
+    lines.append(f"  file          : {cfg.hooks_file or '(none)'}")
     return "\n".join(lines)

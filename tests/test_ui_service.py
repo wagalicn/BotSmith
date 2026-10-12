@@ -724,6 +724,85 @@ def test_empty_address_saved_as_empty_var(project, bot):
     assert env.get("MCP_URL_OA", "") == ""
 
 
+def test_deleting_server_cleans_up_its_env_vars(project, bot):
+    """删掉一个 MCP 服务端后，它在 .env 里的地址变量应被清掉，保留的那个不受影响"""
+    # 先配两个 server 并保存
+    data = service.read_bot(project, "hr-bot")
+    data["values"]["mcp"]["servers"] = [
+        {"name": "oa", "address": "https://oa.internal/mcp", "allow_tools": []},
+        {"name": "crm", "address": "https://crm.internal/mcp", "allow_tools": []},
+    ]
+    service.save_bot(project, "hr-bot", {"values": data["values"]})
+
+    env = service.read_env_file(project / "bots" / "hr-bot" / ".env")
+    assert env["MCP_URL_OA"] == "https://oa.internal/mcp"
+    assert env["MCP_URL_CRM"] == "https://crm.internal/mcp"
+
+    # 模拟前端删掉 crm：read 回来（address 已是明文），去掉 crm 再存
+    reread = service.read_bot(project, "hr-bot")
+    reread["values"]["mcp"]["servers"] = [
+        s for s in reread["values"]["mcp"]["servers"] if s["name"] == "oa"
+    ]
+    service.save_bot(project, "hr-bot", {"values": reread["values"]})
+
+    env2 = service.read_env_file(project / "bots" / "hr-bot" / ".env")
+    assert env2.get("MCP_URL_OA") == "https://oa.internal/mcp"  # 保留的不受影响
+    assert "MCP_URL_CRM" not in env2  # 被删 server 的孤儿变量清掉了
+
+
+def test_deleting_server_cleans_up_its_header_vars(project, bot):
+    """删掉带请求头的 MCP 服务端后，它的 MCP_HEADER_* 变量也应被清掉"""
+    data = service.read_bot(project, "hr-bot")
+    data["values"]["mcp"]["servers"] = [
+        {
+            "name": "oa",
+            "address": "https://oa.internal/mcp",
+            "headers": {"Authorization": "Bearer secret-token"},
+            "allow_tools": [],
+        },
+    ]
+    service.save_bot(project, "hr-bot", {"values": data["values"]})
+
+    env = service.read_env_file(project / "bots" / "hr-bot" / ".env")
+    assert env["MCP_HEADER_OA_AUTHORIZATION"] == "Bearer secret-token"
+
+    # 删掉这个 server（删光所有 server = 纯对话 bot）
+    reread = service.read_bot(project, "hr-bot")
+    reread["values"]["mcp"]["servers"] = []
+    service.save_bot(project, "hr-bot", {"values": reread["values"]})
+
+    env2 = service.read_env_file(project / "bots" / "hr-bot" / ".env")
+    assert "MCP_URL_OA" not in env2
+    assert "MCP_HEADER_OA_AUTHORIZATION" not in env2  # 请求头孤儿变量也清掉了
+
+
+def test_unchanged_server_keeps_env_vars_when_other_deleted(project, bot):
+    """删一个 server 时，另一个未改动 server（address 回传明文）的变量要保留"""
+    data = service.read_bot(project, "hr-bot")
+    data["values"]["mcp"]["servers"] = [
+        {
+            "name": "oa",
+            "address": "https://oa.internal/mcp",
+            "headers": {"Authorization": "Bearer tok-oa"},
+            "allow_tools": [],
+        },
+        {"name": "crm", "address": "https://crm.internal/mcp", "allow_tools": []},
+    ]
+    service.save_bot(project, "hr-bot", {"values": data["values"]})
+
+    # 删 crm，oa 原样保留
+    reread = service.read_bot(project, "hr-bot")
+    reread["values"]["mcp"]["servers"] = [
+        s for s in reread["values"]["mcp"]["servers"] if s["name"] == "oa"
+    ]
+    service.save_bot(project, "hr-bot", {"values": reread["values"]})
+
+    env = service.read_env_file(project / "bots" / "hr-bot" / ".env")
+    assert env.get("MCP_URL_OA") == "https://oa.internal/mcp"
+    assert env.get("MCP_HEADER_OA_AUTHORIZATION") == "Bearer tok-oa"
+    assert "MCP_URL_CRM" not in env
+
+
 # --------------------------------------------------------------------------
 # 前端选项表
 # --------------------------------------------------------------------------
