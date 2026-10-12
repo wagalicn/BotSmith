@@ -31,13 +31,21 @@ from botkit.config import (
     VALID_LOG_LEVELS,
     VALID_SESSION_SCOPES,
     config_summary,
+    get_message_lang,
     load_bot_config,
+    reset_message_lang,
+    set_message_lang,
 )
 from botkit.mcp_client import McpError, McpToolClient, describe_exception
 from botkit.scaffold import ScaffoldError, create_bot, validate_name
 from botkit.yaml_writer import dump_bot_yaml
 
 logger = logging.getLogger("botkit.ui")
+
+
+def _m(zh: str, en: str) -> str:
+    """按当前语言（和 config.py 共用同一个 contextvar）选中/英消息。默认中文。"""
+    return en if get_message_lang() == "en" else zh
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_LINE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=)(.*)$")
@@ -109,17 +117,17 @@ def bot_dir_for(root: Path | str, name: str) -> Path:
     name 是从网页传进来的，必须挡住 ../ 这类路径穿越。
     """
     if not name or not isinstance(name, str):
-        raise UiError("没有指定 Agent 名字")
+        raise UiError(_m("没有指定 Agent 名字", "No Agent name specified"))
 
     parent = bots_root(root)
     candidate = (parent / name).resolve()
 
     if candidate.parent != parent:
-        raise UiError(f"Agent 名字不合法：{name}")
+        raise UiError(_m(f"Agent 名字不合法：{name}", f"Invalid Agent name: {name}"))
     if candidate.name == TRASH_DIRNAME:
-        raise UiError("这不是一个Agent")
+        raise UiError(_m("这不是一个Agent", "This is not an Agent"))
     if not candidate.is_dir():
-        raise UiError(f"找不到这个 Agent：{name}")
+        raise UiError(_m(f"找不到这个 Agent：{name}", f"Agent not found: {name}"))
     return candidate
 
 
@@ -149,9 +157,10 @@ def delete_bot(root: Path | str, name: str) -> dict[str, Any]:
         try:
             shutil.move(str(bot_dir), str(target))
         except Exception as inner:
-            raise UiError(
-                f"删除失败：{type(inner).__name__}: {inner}"
-            ) from inner
+            raise UiError(_m(
+                f"删除失败：{type(inner).__name__}: {inner}",
+                f"Delete failed: {type(inner).__name__}: {inner}",
+            )) from inner
         _ = e
 
     logger.info("已把Agent %s 移到回收站：%s", name, target)
@@ -325,11 +334,15 @@ def read_bot(root: Path | str, name: str) -> dict[str, Any]:
     try:
         raw = yaml.safe_load((bot_dir / "bot.yaml").read_text(encoding="utf-8"))
     except yaml.YAMLError as e:
-        raise UiError(
-            f"bot.yaml 不是合法的 YAML，页面没法打开。请先手动修好：\n{e}"
-        ) from e
+        raise UiError(_m(
+            f"bot.yaml 不是合法的 YAML，页面没法打开。请先手动修好：\n{e}",
+            f"bot.yaml is not valid YAML, the page can't open it. Please fix it manually first:\n{e}",
+        )) from e
     if not isinstance(raw, dict):
-        raise UiError("bot.yaml 的顶层不是键值对，页面没法打开")
+        raise UiError(_m(
+            "bot.yaml 的顶层不是键值对，页面没法打开",
+            "The top level of bot.yaml is not key-value pairs, the page can't open it",
+        ))
 
     prompt_text = ""
     prompt_file = ((raw.get("prompt") or {}) if isinstance(raw.get("prompt"), dict) else {}).get("file")
@@ -512,7 +525,10 @@ def save_bot(root: Path | str, name: str, payload: dict[str, Any]) -> dict[str, 
 
     values = payload.get("values")
     if not isinstance(values, dict):
-        raise UiError("提交的配置格式不对（values 应该是对象）")
+        raise UiError(_m(
+            "提交的配置格式不对（values 应该是对象）",
+            "The submitted config format is wrong (values should be an object)",
+        ))
 
     # 名字以目录为准，避免页面改了名字导致目录和配置不一致
     values = dict(values)
@@ -539,7 +555,10 @@ def save_bot(root: Path | str, name: str, payload: dict[str, Any]) -> dict[str, 
     if prompt_file and isinstance(prompt_text, str):
         target = (bot_dir / str(prompt_file)).resolve()
         if not str(target).startswith(str(bot_dir)):
-            raise UiError(f"提示词文件路径不合法：{prompt_file}")
+            raise UiError(_m(
+                f"提示词文件路径不合法：{prompt_file}",
+                f"Invalid prompt file path: {prompt_file}",
+            ))
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(prompt_text.rstrip("\n") + "\n", encoding="utf-8")
 
@@ -575,36 +594,42 @@ def _extract_server_addresses(
     """
     servers = _servers_of(values)
 
-    # 先记下改动前 .env 里已有的 MCP 地址/请求头变量，用于清理孤儿
+    # 改动前 .env 里已有的 MCP 地址/请求头变量
     existing = read_env_file(bot_dir / ".env")
-    stale = {k for k in existing if is_mcp_url_var(k) or is_mcp_header_var(k)}
+    existing_mcp = {k for k in existing if is_mcp_url_var(k) or is_mcp_header_var(k)}
+
+    # keep：本次保存后、这些在列 server 应当保留的 MCP 变量。
+    # 用「正向收集应保留 + 最后做差集」代替逐分支 discard —— 这样改名、删请求头、
+    # 乃至整个 server 被删（它根本不在 servers 里，变量名不会进 keep），
+    # 都能统一清理掉遗留的孤儿变量。
+    keep: set[str] = set()
 
     updates: dict[str, str] = {}
     for server in servers:
         sname = str(server.get("name") or "").strip()
-        # address 是前端传的明文；没传就回退到「解析当前 url 占位符拿到的旧值」
+        # address 是前端传的明文；没传（老客户端/未改动）则为 None
         address = server.pop("address", None)
 
         # 请求头：前端传的是明文 {头名: 值}。把非空的落 .env、值换成占位符。
-        _extract_server_headers(server, sname, updates, stale)
+        _extract_server_headers(server, sname, updates, keep)
 
         # 空行（没标识名、也没填地址）：不生成任何 MCP_URL 变量，url 留空
         if not sname and not (address or "").strip():
             server["url"] = ""
             continue
 
-        if sname:
-            var = mcp_url_var_for(sname)
-        else:
+        if not sname:
             # 没标识名时保持 url 原样，不动（_check_values 会拦空名的多 server 情况）
             continue
 
+        var = mcp_url_var_for(sname)
+
         if address is None:
-            # 前端没带 address（比如老客户端）：保留原 url，不改动
-            # 但如果 url 已经是我们的占位符，别把它算成 stale
+            # 前端没带 address（比如老客户端、或这个 server 这次没改）：保留原 url。
+            # 若原 url 正好是我们的占位符，把它对应的变量记进 keep，别被当孤儿删掉。
             current_var = _server_url_var(server)
             if current_var:
-                stale.discard(current_var)
+                keep.add(current_var)
             continue
 
         if not str(address).strip():
@@ -615,9 +640,11 @@ def _extract_server_addresses(
 
         server["url"] = "${" + var + "}"
         updates[var] = str(address).strip()
-        stale.discard(var)
+        keep.add(var)
 
-    # 清理：改名/删头后旧的 MCP_URL_XXX / MCP_HEADER_XXX 变量从 .env 删掉
+    # 孤儿清理：.env 里现有的 MCP 变量，凡是不在 keep（即不属于任何在列 server）
+    # 的，都删掉。覆盖改名、删请求头、删整个 server 三种情况。
+    stale = existing_mcp - keep
     if stale:
         _remove_env_vars(bot_dir / ".env", stale)
 
@@ -628,7 +655,7 @@ def _extract_server_headers(
     server: dict[str, Any],
     sname: str,
     updates: dict[str, str],
-    stale: set[str],
+    keep: set[str],
 ) -> None:
     """
     把一个 server 前端填的明文 headers 转成 .env 变量并改成占位符（就地改 server）。
@@ -636,7 +663,8 @@ def _extract_server_headers(
     - 空头名或空值的条目直接丢弃（前端留了空行不算）。
     - 有标识名时，值落到 MCP_HEADER_<SERVER>_<HEADER>，headers 里存占位符。
     - 没标识名时保持原样不动。
-    updates / stale 会被就地更新。
+    updates 会被就地更新；这个 server 应保留的 MCP 请求头变量名加进 keep
+    （供上层做孤儿清理的差集）。
     """
     raw_headers = server.get("headers")
     if not isinstance(raw_headers, dict):
@@ -653,10 +681,17 @@ def _extract_server_headers(
             # 没标识名：原样保留（多半是手写配置，_check_values 会拦空名多 server）
             out[hname] = hval
             continue
+        # 值可能本就是 ${VAR} 占位符（用户手填，或前端没解析成明文）：
+        # 这时直接沿用该变量名、保留它，不要再包一层。
+        existing_var = _sole_placeholder_var(hval)
+        if existing_var and is_mcp_header_var(existing_var):
+            out[hname] = "${" + existing_var + "}"
+            keep.add(existing_var)
+            continue
         var = mcp_header_var_for(sname, hname)
         out[hname] = "${" + var + "}"
         updates[var] = hval
-        stale.discard(var)
+        keep.add(var)
 
     if out:
         server["headers"] = out
@@ -739,9 +774,10 @@ def _check_values(values: dict[str, Any]) -> None:
         if value in (None, ""):
             return
         if str(value) not in allowed:
-            raise UiError(
-                f"{section}.{key} 只能是 {'、'.join(allowed)} 之一，收到的是 {value!r}"
-            )
+            raise UiError(_m(
+                f"{section}.{key} 只能是 {'、'.join(allowed)} 之一，收到的是 {value!r}",
+                f"{section}.{key} must be one of {', '.join(allowed)}, got {value!r}",
+            ))
 
     enum("llm", "client", VALID_LLM_CLIENTS)
     enum("session", "scope", VALID_SESSION_SCOPES)
@@ -750,16 +786,20 @@ def _check_values(values: dict[str, Any]) -> None:
     log = values.get("logging")
     if isinstance(log, dict) and log.get("level"):
         if str(log["level"]).upper() not in VALID_LOG_LEVELS:
-            raise UiError(
-                f"logging.level 只能是 {'、'.join(VALID_LOG_LEVELS)} 之一"
-            )
+            raise UiError(_m(
+                f"logging.level 只能是 {'、'.join(VALID_LOG_LEVELS)} 之一",
+                f"logging.level must be one of {', '.join(VALID_LOG_LEVELS)}",
+            ))
 
     identity = values.get("identity")
     if isinstance(identity, dict) and identity.get("pattern"):
         try:
             re.compile(str(identity["pattern"]))
         except re.error as e:
-            raise UiError(f"身份校验正则写得不对：{e}") from e
+            raise UiError(_m(
+                f"身份校验正则写得不对：{e}",
+                f"The identity validation regex is invalid: {e}",
+            )) from e
 
     # MCP 服务端校验：只校验「真的要用」的 server（填了地址的）。
     # 没填地址的行视为还没配好的空行，直接跳过 —— 纯对话 bot 用不到工具，
@@ -778,9 +818,15 @@ def _check_values(values: dict[str, Any]) -> None:
                 continue
             name = str(server.get("name") or "").strip()
             if not name:
-                raise UiError(f"第 {i + 1} 个 MCP 服务端填了地址但还没填标识名")
+                raise UiError(_m(
+                    f"第 {i + 1} 个 MCP 服务端填了地址但还没填标识名",
+                    f"MCP server #{i + 1} has an address but no identifier yet",
+                ))
             if name in seen:
-                raise UiError(f"有两个 MCP 服务端都叫「{name}」，标识名要唯一")
+                raise UiError(_m(
+                    f"有两个 MCP 服务端都叫「{name}」，标识名要唯一",
+                    f"Two MCP servers are both named \"{name}\"; identifiers must be unique",
+                ))
             seen.add(name)
 
     # 前置拦截校验：完全空的规则（页面加了没填）直接丢弃，不拦住保存；
@@ -798,16 +844,23 @@ def _check_values(values: dict[str, Any]) -> None:
             if not match and not regex and not reply:
                 continue
             if not reply:
-                raise UiError(f"第 {i + 1} 条拦截规则还没填「命中后的回复」")
+                raise UiError(_m(
+                    f"第 {i + 1} 条拦截规则还没填「命中后的回复」",
+                    f"Intercept rule #{i + 1} is missing the \"reply on match\"",
+                ))
             if not match and not regex:
-                raise UiError(
-                    f"第 {i + 1} 条拦截规则要至少填「关键词」或「正则」中的一个"
-                )
+                raise UiError(_m(
+                    f"第 {i + 1} 条拦截规则要至少填「关键词」或「正则」中的一个",
+                    f"Intercept rule #{i + 1} needs at least one of keywords or regex",
+                ))
             if regex:
                 try:
                     re.compile(regex)
                 except re.error as e:
-                    raise UiError(f"第 {i + 1} 条拦截规则的正则写得不对：{e}") from e
+                    raise UiError(_m(
+                        f"第 {i + 1} 条拦截规则的正则写得不对：{e}",
+                        f"The regex in intercept rule #{i + 1} is invalid: {e}",
+                    )) from e
             # 规范化：写回清洗后的值
             rule["match"] = match
             if regex:
@@ -910,20 +963,32 @@ def import_bot(root: Path | str, payload: dict[str, Any]) -> dict[str, Any]:
     - 名字已存在会报错，不覆盖。
     """
     if not isinstance(payload, dict):
-        raise UiError("导入内容应该是一个 JSON 对象")
+        raise UiError(_m(
+            "导入内容应该是一个 JSON 对象",
+            "The import content should be a JSON object",
+        ))
 
     values = payload.get("values")
     if not isinstance(values, dict):
-        raise UiError("导入内容缺少 values（bot.yaml 的结构），或格式不对")
+        raise UiError(_m(
+            "导入内容缺少 values（bot.yaml 的结构），或格式不对",
+            "The import content is missing values (the bot.yaml structure), or is malformed",
+        ))
 
     name = str(payload.get("name") or values.get("name") or "").strip()
     if not name:
-        raise UiError("导入内容里没有 Agent 名字（name），补一个再导入")
+        raise UiError(_m(
+            "导入内容里没有 Agent 名字（name），补一个再导入",
+            "The import content has no Agent name; add one and import again",
+        ))
 
     # 名字合法性 + 是否已存在，都在 create_new_bot 里用脚手架统一校验
     parent = bots_root(root)
     if (parent / name).exists():
-        raise UiError(f"已经有一个叫「{name}」的 Agent 了，换个名字或先删掉旧的")
+        raise UiError(_m(
+            f"已经有一个叫「{name}」的 Agent 了，换个名字或先删掉旧的",
+            f"An Agent named \"{name}\" already exists; use another name or delete the old one first",
+        ))
 
     create_new_bot(root, name)
 
@@ -964,9 +1029,10 @@ def skills_root(root: Path | str = ".") -> Path:
 def _check_skill_name(filename: str) -> str:
     name = (filename or "").strip()
     if not _SKILL_NAME.match(name):
-        raise UiError(
-            f"技能文件名不合法：{filename}（用字母/数字开头，只能含字母数字下划线连字符，且以 .md 结尾）"
-        )
+        raise UiError(_m(
+            f"技能文件名不合法：{filename}（用字母/数字开头，只能含字母数字下划线连字符，且以 .md 结尾）",
+            f"Invalid skill file name: {filename} (start with a letter/digit, only letters/digits/underscores/hyphens, ending in .md)",
+        ))
     return name
 
 
@@ -1041,11 +1107,11 @@ def upload_skill(root: Path | str, filename: str, content: str) -> dict[str, Any
     """写入/覆盖一个共享 skill 文件"""
     name = _check_skill_name(filename)
     if not isinstance(content, str) or not content.strip():
-        raise UiError("技能内容是空的")
+        raise UiError(_m("技能内容是空的", "The skill content is empty"))
     sdir = skills_root(root)
     target = (sdir / name).resolve()
     if target.parent != sdir:
-        raise UiError(f"技能文件名不合法：{filename}")
+        raise UiError(_m(f"技能文件名不合法：{filename}", f"Invalid skill file name: {filename}"))
     target.write_text(content.rstrip("\n") + "\n", encoding="utf-8")
     return {"name": name, "skills": list_skills(root)}
 
@@ -1072,7 +1138,10 @@ def _remove_skill_ref(bot_dir: Path, name: str) -> bool:
 
     text = dump_bot_yaml(updated)
     if yaml.safe_load(text) != updated:
-        raise UiError(f"{bot_dir.name} 的 bot.yaml 无法安全地自动改写")
+        raise UiError(_m(
+            f"{bot_dir.name} 的 bot.yaml 无法安全地自动改写",
+            f"Cannot safely auto-rewrite {bot_dir.name}'s bot.yaml",
+        ))
 
     (bot_dir / "bot.yaml").write_text(text, encoding="utf-8")
     return True
@@ -1092,7 +1161,7 @@ def delete_skill(root: Path | str, filename: str) -> dict[str, Any]:
     sdir = skills_root(root)
     target = (sdir / name).resolve()
     if target.parent != sdir:
-        raise UiError(f"技能文件名不合法：{filename}")
+        raise UiError(_m(f"技能文件名不合法：{filename}", f"Invalid skill file name: {filename}"))
 
     cleaned: list[str] = []
     skipped: list[str] = []
@@ -1168,7 +1237,7 @@ async def preview_chat(
 
     message = (message or "").strip()
     if not message:
-        raise UiError("先输入一句话再发送")
+        raise UiError(_m("先输入一句话再发送", "Type a line before sending"))
 
     bot_dir = bot_dir_for(root, name)
 
@@ -1176,9 +1245,10 @@ async def preview_chat(
         try:
             cfg = load_bot_config(bot_dir)
         except ConfigError as e:
-            raise UiError(
-                "配置还没通过校验，没法预览。先把下面的问题解决：\n\n" + str(e)
-            ) from e
+            raise UiError(_m(
+                "配置还没通过校验，没法预览。先把下面的问题解决：\n\n" + str(e),
+                "Config hasn't passed validation, can't preview. Fix the problems below first:\n\n" + str(e),
+            )) from e
 
         used_identity = identity or _sample_identity(cfg)
 
@@ -1235,35 +1305,46 @@ async def preview_chat(
             # 身份不符 pattern：pipeline 会返回 identity_invalid 文案而不抛异常。
             # 预览里把它翻成可操作的提示（和之前 engine.chat 抛 IdentityRejected 时一致）。
             if result.kind == KIND_IDENTITY_INVALID:
-                raise UiError(
+                raise UiError(_m(
                     f"预览用的身份 {used_identity!r} 不符合 identity.pattern。"
-                    "去「身份与安全」页调整校验规则，或改用别的身份预览。"
-                )
+                    "去「身份与安全」页调整校验规则，或改用别的身份预览。",
+                    f"The preview identity {used_identity!r} doesn't match identity.pattern. "
+                    "Adjust the validation rule on the \"Identity & Security\" tab, or preview with a different identity.",
+                ))
             # handle 不抛异常：LLM / MCP 连不上会被吞成 messages.error。
             # 预览要让人看清是不是连接问题，所以命中 error 分支时给明确提示。
             if result.kind == KIND_ERROR:
-                raise UiError(
+                raise UiError(_m(
                     "进入大模型 / 工具阶段时出错（预览需要真的连上 LLM 和 MCP）。"
-                    "请查看Agent日志确认是密钥、地址还是网络问题。"
-                )
+                    "请查看Agent日志确认是密钥、地址还是网络问题。",
+                    "An error occurred entering the LLM / tool stage (preview needs to really connect to the LLM and MCP). "
+                    "Check the Agent logs to see if it's a key, address, or network issue.",
+                ))
         except IdentityRejected:
-            raise UiError(
+            raise UiError(_m(
                 f"预览用的身份 {used_identity!r} 不符合 identity.pattern。"
-                "去「身份与安全」页调整校验规则，或改用别的身份预览。"
-            ) from None
+                "去「身份与安全」页调整校验规则，或改用别的身份预览。",
+                f"The preview identity {used_identity!r} doesn't match identity.pattern. "
+                "Adjust the validation rule on the \"Identity & Security\" tab, or preview with a different identity.",
+            )) from None
         except McpError as e:
-            raise UiError(
-                "调用 MCP 工具失败（预览需要真的连上工具服务端）：\n\n" + str(e)
-            ) from e
+            raise UiError(_m(
+                "调用 MCP 工具失败（预览需要真的连上工具服务端）：\n\n" + str(e),
+                "Failed to call the MCP tool (preview needs to really connect to the tool server):\n\n" + str(e),
+            )) from e
         except LlmError as e:
-            raise UiError(
-                "调用大模型失败（预览需要真的连上 LLM）：\n\n" + str(e)
-            ) from e
+            raise UiError(_m(
+                "调用大模型失败（预览需要真的连上 LLM）：\n\n" + str(e),
+                "Failed to call the model (preview needs to really connect to the LLM):\n\n" + str(e),
+            )) from e
         except UiError:
             raise
         except Exception as e:
             logger.exception("预览 %s 时出错", name)
-            raise UiError(f"预览时出错（{type(e).__name__}）：{e}") from e
+            raise UiError(_m(
+                f"预览时出错（{type(e).__name__}）：{e}",
+                f"Error during preview ({type(e).__name__}): {e}",
+            )) from e
         finally:
             await engine.aclose()
 
@@ -1299,15 +1380,19 @@ async def probe_mcp(
         try:
             cfg = load_bot_config(bot_dir)
         except ConfigError as e:
-            raise UiError(
-                "配置还没通过校验，没法探测。先把下面的问题解决：\n\n" + str(e)
-            ) from e
+            raise UiError(_m(
+                "配置还没通过校验，没法探测。先把下面的问题解决：\n\n" + str(e),
+                "Config hasn't passed validation, can't probe. Fix the problems below first:\n\n" + str(e),
+            )) from e
 
         servers = cfg.mcp.servers
         if server_name:
             servers = [s for s in servers if s.name == server_name]
             if not servers:
-                raise UiError(f"配置里没有名叫 {server_name} 的 MCP 服务端")
+                raise UiError(_m(
+                    f"配置里没有名叫 {server_name} 的 MCP 服务端",
+                    f"No MCP server named {server_name} in the config",
+                ))
 
         identity = _sample_identity(cfg)
         results: list[dict[str, Any]] = []
@@ -1405,9 +1490,10 @@ async def probe_wecom(
         try:
             cfg = load_bot_config(bot_dir)
         except ConfigError as e:
-            raise UiError(
-                "配置还没通过校验，没法连企微。先把下面的问题解决：\n\n" + str(e)
-            ) from e
+            raise UiError(_m(
+                "配置还没通过校验，没法连企微。先把下面的问题解决：\n\n" + str(e),
+                "Config hasn't passed validation, can't connect to WeCom. Fix the problems below first:\n\n" + str(e),
+            )) from e
         bot_id = cfg.wecom.bot_id
         secret = cfg.wecom.bot_secret
         pattern = cfg.identity.pattern
@@ -1443,7 +1529,10 @@ async def probe_wecom(
         try:
             await asyncio.wait_for(authed, timeout=20)
         except asyncio.TimeoutError:
-            raise UiError("连上了企微但一直没通过认证，请检查 bot_id 和 secret") from None
+            raise UiError(_m(
+                "连上了企微但一直没通过认证，请检查 bot_id 和 secret",
+                "Connected to WeCom but authentication kept failing; check bot_id and secret",
+            )) from None
         result["authenticated"] = True
 
         if wait_for_message:
@@ -1456,7 +1545,10 @@ async def probe_wecom(
     except UiError:
         raise
     except Exception as e:
-        raise UiError(f"连接企微失败（{type(e).__name__}）：{e}") from e
+        raise UiError(_m(
+            f"连接企微失败（{type(e).__name__}）：{e}",
+            f"Failed to connect to WeCom ({type(e).__name__}): {e}",
+        )) from e
     finally:
         try:
             client.disconnect()

@@ -17,10 +17,26 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
+from botkit.config import get_message_lang, reset_message_lang, set_message_lang
 from botkit.ui import service
 from botkit.ui.service import UiError
 
 logger = logging.getLogger("botkit.ui")
+
+
+def _m(zh: str, en: str) -> str:
+    """按当前语言选中/英消息（和 config/service 共用同一个 contextvar）。"""
+    return en if get_message_lang() == "en" else zh
+
+
+def _lang_from_header(accept_language: str) -> str:
+    """从 Accept-Language 头粗略判断中/英。默认中文（和后端默认一致）。"""
+    al = (accept_language or "").lower()
+    # 浏览器切成英文时头形如 "en-US,en;q=0.9"；只要排在中文前面就按英文
+    first = al.split(",")[0].strip()
+    if first.startswith("en"):
+        return "en"
+    return "zh"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8771
@@ -42,6 +58,23 @@ def _fail(message: str, status: int = 400) -> web.Response:
 
 
 @web.middleware
+async def lang_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+    """
+    按请求的 Accept-Language 设置后端报错/摘要的语言，请求结束后恢复。
+
+    放在最外层：这样 error_middleware 的兜底消息、以及各 handler 调到的
+    service / config 层报错都能按浏览器选的语言输出。CLI / 运行时不经过这里，
+    默认永远中文。
+    """
+    lang = _lang_from_header(request.headers.get("Accept-Language", ""))
+    token = set_message_lang(lang)
+    try:
+        return await handler(request)
+    finally:
+        reset_message_lang(token)
+
+
+@web.middleware
 async def error_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
     """
     把异常统一转成 JSON。UiError 的消息是写给用户看的，直接透出；
@@ -55,7 +88,10 @@ async def error_middleware(request: web.Request, handler: Handler) -> web.Stream
         raise
     except Exception as e:
         logger.exception("处理 %s %s 时出错", request.method, request.path)
-        return _fail(f"服务端出错（{type(e).__name__}）：{e}", status=500)
+        return _fail(_m(
+            f"服务端出错（{type(e).__name__}）：{e}",
+            f"Server error ({type(e).__name__}): {e}",
+        ), status=500)
 
 
 @web.middleware
@@ -69,7 +105,10 @@ async def local_only_middleware(
     peer = request.remote or ""
     if peer not in ("127.0.0.1", "::1", "localhost"):
         logger.warning("拒绝了来自 %s 的请求（配置页面只允许本机访问）", peer)
-        return _fail("配置页面只允许本机访问", status=403)
+        return _fail(_m(
+            "配置页面只允许本机访问",
+            "The config page is accessible from the local machine only",
+        ), status=403)
     return await handler(request)
 
 
@@ -186,9 +225,15 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
     try:
         payload = await request.json()
     except Exception as e:
-        raise UiError(f"请求体不是合法 JSON：{e}") from e
+        raise UiError(_m(
+            f"请求体不是合法 JSON：{e}",
+            f"The request body is not valid JSON: {e}",
+        )) from e
     if not isinstance(payload, dict):
-        raise UiError("请求体应该是一个 JSON 对象")
+        raise UiError(_m(
+            "请求体应该是一个 JSON 对象",
+            "The request body should be a JSON object",
+        ))
     return payload
 
 
@@ -206,13 +251,32 @@ async def index(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def static_file(request: web.Request) -> web.StreamResponse:
+    """
+    服务 static/ 下的资源，禁用缓存。
+
+    配置页面是本机小工具、会频繁迭代，浏览器缓存住旧的 app.js / i18n.js
+    会让"改了不生效"（典型表现：新按钮点了没反应）。所以这里统一 no-store，
+    不走 add_static 的默认缓存策略。
+    """
+    name = request.match_info["name"]
+    target = (STATIC_DIR / name).resolve()
+    # 防目录穿越：解析后必须仍在 STATIC_DIR 内
+    base = STATIC_DIR.resolve()
+    if not target.is_relative_to(base) or not target.is_file():
+        return web.Response(text="not found", status=404)
+    return web.FileResponse(target, headers={"Cache-Control": "no-store"})
+
+
 # --------------------------------------------------------------------------
 # 组装
 # --------------------------------------------------------------------------
 
 
 def create_app(project_root: Path | str = ".") -> web.Application:
-    app = web.Application(middlewares=[local_only_middleware, error_middleware])
+    app = web.Application(
+        middlewares=[lang_middleware, local_only_middleware, error_middleware]
+    )
     app[PROJECT_ROOT] = Path(project_root).resolve()
 
     app.router.add_get("/", index)

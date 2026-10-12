@@ -103,9 +103,10 @@ def test_js_tabs_match_html_panels():
     js = _read_static("app.js")
 
     panels = set(re.findall(r'data-panel="([^"]+)"', html))
-    # TABS 数组里的 id
-    tabs_block = js[js.index("const TABS"): js.index("// -------", js.index("const TABS"))]
-    tabs = set(re.findall(r'id:\s*"([A-Za-z0-9_-]+)"', tabs_block))
+    # TAB_IDS 数组里的 id（i18n 后 tab 文案走 t("tab." + id)，这里只校验 id 集合）
+    start = js.index("const TAB_IDS")
+    tabs_block = js[start: js.index("]", start)]
+    tabs = set(re.findall(r'"([A-Za-z0-9_-]+)"', tabs_block))
 
     assert tabs == panels, f"分区对不上：JS 有 {sorted(tabs)}，HTML 有 {sorted(panels)}"
 
@@ -293,6 +294,40 @@ async def test_validate_endpoint_reports_error(client):
     data = await (await client.post("/api/bots/fresh/validate")).json()
     assert data["ok"] is False
     assert "WECHAT_BOT_ID" in data["error"]
+
+
+async def test_validate_error_defaults_to_chinese(client):
+    """不带 Accept-Language 时，校验报错默认中文（CLI/运行时行为不变的保证）"""
+    await client.post("/api/bots", json={"name": "zh-bot"})
+    data = await (await client.post("/api/bots/zh-bot/validate")).json()
+    assert data["ok"] is False
+    # 中文模板里的词
+    assert "环境变量" in data["error"] or "至少" in data["error"]
+
+
+async def test_validate_error_in_english_with_accept_language(client):
+    """带 Accept-Language: en 时，校验报错走英文"""
+    await client.post("/api/bots", json={"name": "en-bot"})
+    resp = await client.post(
+        "/api/bots/en-bot/validate", headers={"Accept-Language": "en-US,en;q=0.9"}
+    )
+    data = await resp.json()
+    assert data["ok"] is False
+    # 英文模板里的词，且不含中文
+    assert "environment variable" in data["error"] or "needs at least one" in data["error"]
+    assert "环境变量" not in data["error"]
+
+
+async def test_summary_in_english_with_accept_language(client, ready_bot):
+    """带 Accept-Language: en 时，配置摘要用英文标签"""
+    resp = await client.post(
+        "/api/bots/hr-bot/validate", headers={"Accept-Language": "en"}
+    )
+    data = await resp.json()
+    assert data["ok"] is True
+    assert "[LLM]" in data["summary"]
+    assert "backend" in data["summary"]  # 英文标签
+    assert "后端" not in data["summary"]  # 不含中文标签
 
 
 # --------------------------------------------------------------------------
