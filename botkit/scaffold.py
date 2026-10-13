@@ -14,7 +14,14 @@ import logging
 import re
 from pathlib import Path
 
+from botkit.config import get_message_lang
+
 logger = logging.getLogger("botkit.scaffold")
+
+
+def _m(zh: str, en: str) -> str:
+    """按当前语言选中/英消息（和 config/ui 共用同一个 contextvar）。默认中文。"""
+    return en if get_message_lang() == "en" else zh
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 
@@ -39,12 +46,14 @@ def validate_name(name: str) -> str:
     """校验 bot 名字。它会成为目录名，不能是奇怪的字符"""
     name = (name or "").strip()
     if not name:
-        raise ScaffoldError("Agent 名字不能为空")
+        raise ScaffoldError(_m("Agent 名字不能为空", "Agent name cannot be empty"))
     if not _VALID_NAME.match(name):
-        raise ScaffoldError(
+        raise ScaffoldError(_m(
             f"Agent 名字 {name!r} 不合法。要求：字母开头，只能包含字母、数字、下划线和连字符。"
-            "例如 hr-assistant、crm_bot"
-        )
+            "例如 hr-assistant、crm_bot",
+            f"Invalid Agent name {name!r}. Must start with a letter and contain only letters, "
+            "digits, underscores, and hyphens. E.g. hr-assistant, crm_bot",
+        ))
     return name
 
 
@@ -71,18 +80,26 @@ def create_bot(
     target = (parent_path / name).resolve()
 
     if target.exists() and any(target.iterdir()) and not force:
-        raise ScaffoldError(
+        raise ScaffoldError(_m(
             f"目录已存在且不是空的：{target}\n"
-            f"换个名字，或者加 --force 覆盖同名文件（会保留目录里的其他文件）"
-        )
+            f"换个名字，或者加 --force 覆盖同名文件（会保留目录里的其他文件）",
+            f"The directory already exists and is not empty: {target}\n"
+            f"Use another name, or add --force to overwrite same-named files (keeps other files in the directory)",
+        ))
 
     if not TEMPLATE_DIR.is_dir():
-        raise ScaffoldError(f"找不到模板目录：{TEMPLATE_DIR}")
+        raise ScaffoldError(_m(
+            f"找不到模板目录：{TEMPLATE_DIR}",
+            f"Template directory not found: {TEMPLATE_DIR}",
+        ))
 
     try:
         target.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        raise ScaffoldError(f"创建目录 {target} 失败：{e}") from e
+        raise ScaffoldError(_m(
+            f"创建目录 {target} 失败：{e}",
+            f"Failed to create directory {target}: {e}",
+        )) from e
 
     # README 和 bot.yaml 里要写「怎么跑」，用相对路径更好抄
     try:
@@ -93,7 +110,10 @@ def create_bot(
     for template_name, out_name in TEMPLATE_FILES.items():
         template_path = TEMPLATE_DIR / template_name
         if not template_path.is_file():
-            raise ScaffoldError(f"模板文件缺失：{template_path}")
+            raise ScaffoldError(_m(
+                f"模板文件缺失：{template_path}",
+                f"Template file missing: {template_path}",
+            ))
 
         content = render(
             template_path.read_text(encoding="utf-8"), name, display_dir

@@ -271,9 +271,76 @@ def test_parser_new_options():
     assert args.force is True
 
 
+def test_parser_serve_api_defaults():
+    args = build_parser().parse_args(["serve-api", "bots/hr-bot"])
+    assert args.command == "serve-api"
+    assert args.bot_dir == "bots/hr-bot"
+    assert args.port is None  # 没传 --port 时为 None，走环境变量/配置
+
+
+def test_parser_serve_api_port():
+    args = build_parser().parse_args(["serve-api", "bots/hr-bot", "--port", "9003"])
+    assert args.port == 9003
+
+
 def test_unknown_subcommand():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["deploy"])
+
+
+# --------------------------------------------------------------------------
+# serve-api 端口覆盖优先级：--port > BOTKIT_API_PORT > api.port
+# --------------------------------------------------------------------------
+
+
+def test_resolve_api_port_defaults_to_config():
+    """都没给时用 bot.yaml 的 api.port"""
+    from botkit.cli import resolve_api_port
+
+    assert resolve_api_port(None, {}, 9000) == 9000
+
+
+def test_resolve_api_port_env_overrides_config():
+    """BOTKIT_API_PORT 覆盖 api.port"""
+    from botkit.cli import resolve_api_port
+
+    assert resolve_api_port(None, {"BOTKIT_API_PORT": "9002"}, 9000) == 9002
+
+
+def test_resolve_api_port_cli_overrides_env_and_config():
+    """--port 优先级最高，盖过环境变量和配置"""
+    from botkit.cli import resolve_api_port
+
+    assert resolve_api_port(9003, {"BOTKIT_API_PORT": "9002"}, 9000) == 9003
+
+
+def test_resolve_api_port_blank_env_falls_through():
+    """BOTKIT_API_PORT 是空串时当没设，回退到 api.port"""
+    from botkit.cli import resolve_api_port
+
+    assert resolve_api_port(None, {"BOTKIT_API_PORT": "  "}, 9000) == 9000
+
+
+def test_resolve_api_port_rejects_non_integer_env():
+    from botkit.cli import resolve_api_port
+
+    with pytest.raises(ValueError, match="BOTKIT_API_PORT"):
+        resolve_api_port(None, {"BOTKIT_API_PORT": "abc"}, 9000)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 70000])
+def test_resolve_api_port_rejects_out_of_range(bad):
+    from botkit.cli import resolve_api_port
+
+    with pytest.raises(ValueError):
+        resolve_api_port(bad, {}, 9000)
+
+
+def test_resolve_api_port_rejects_out_of_range_env():
+    from botkit.cli import resolve_api_port
+
+    with pytest.raises(ValueError):
+        resolve_api_port(None, {"BOTKIT_API_PORT": "99999"}, 9000)
 
 
 # --------------------------------------------------------------------------
