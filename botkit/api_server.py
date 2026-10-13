@@ -33,11 +33,27 @@ from typing import Any
 
 from aiohttp import web
 
-from botkit.config import BotConfig
+from botkit.config import (
+    BotConfig,
+    get_message_lang,
+    reset_message_lang,
+    set_message_lang,
+)
 from botkit.hooks import Hooks
 from botkit.runtime import MessagePipeline
 
 logger = logging.getLogger("botkit.api")
+
+
+def _m(zh: str, en: str) -> str:
+    """按当前语言选中/英消息。默认中文。"""
+    return en if get_message_lang() == "en" else zh
+
+
+def _lang_from_header(accept_language: str) -> str:
+    """从 Accept-Language 头粗略判断中/英。默认中文。"""
+    first = (accept_language or "").lower().split(",")[0].strip()
+    return "en" if first.startswith("en") else "zh"
 
 PIPELINE = web.AppKey("pipeline", MessagePipeline)
 CONFIG = web.AppKey("config", BotConfig)
@@ -56,7 +72,10 @@ def check_auth(request: web.Request, cfg: BotConfig) -> web.Response | None:
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {token}":
         return web.json_response(
-            {"error": "未授权：请在请求头带 Authorization: Bearer <token>"},
+            {"error": _m(
+                "未授权：请在请求头带 Authorization: Bearer <token>",
+                "Unauthorized: send Authorization: Bearer <token> in the header",
+            )},
             status=401,
         )
     return None
@@ -85,41 +104,62 @@ def _frame_from_request(message: str, user: str, session_id: str) -> dict[str, A
 async def _handle_chat(request: web.Request) -> web.Response:
     cfg: BotConfig = request.app[CONFIG]
 
-    # 鉴权：配了 token 才校验 Authorization: Bearer <token>
-    unauthorized = check_auth(request, cfg)
-    if unauthorized is not None:
-        return unauthorized
-
+    # 对外接口按调用方的 Accept-Language 返回中/英错误；默认中文。
+    # 用 try/finally 恢复，避免污染后续请求。
+    token = set_message_lang(_lang_from_header(request.headers.get("Accept-Language", "")))
     try:
-        payload = await request.json()
-    except Exception:
-        return web.json_response({"error": "请求体不是合法 JSON"}, status=400)
-    if not isinstance(payload, dict):
-        return web.json_response({"error": "请求体应该是一个 JSON 对象"}, status=400)
+        # 鉴权：配了 token 才校验 Authorization: Bearer <token>
+        unauthorized = check_auth(request, cfg)
+        if unauthorized is not None:
+            return unauthorized
 
-    message = str(payload.get("message") or "").strip()
-    user = str(payload.get("user") or "").strip()
-    session_id = str(payload.get("session_id") or "").strip()
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": _m("请求体不是合法 JSON", "The request body is not valid JSON")},
+                status=400,
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"error": _m("请求体应该是一个 JSON 对象", "The request body should be a JSON object")},
+                status=400,
+            )
 
-    if not message:
-        return web.json_response({"error": "缺少 message"}, status=400)
-    if not user:
-        return web.json_response({"error": "缺少 user（调用方要提供用户标识）"}, status=400)
+        message = str(payload.get("message") or "").strip()
+        user = str(payload.get("user") or "").strip()
+        session_id = str(payload.get("session_id") or "").strip()
 
-    pipeline: MessagePipeline = request.app[PIPELINE]
-    frame = _frame_from_request(message, user, session_id)
+        if not message:
+            return web.json_response(
+                {"error": _m("缺少 message", "Missing message")}, status=400
+            )
+        if not user:
+            return web.json_response(
+                {"error": _m(
+                    "缺少 user（调用方要提供用户标识）",
+                    "Missing user (the caller must provide a user identifier)",
+                )},
+                status=400,
+            )
 
-    try:
-        reply = await pipeline.handle(frame)
-    except Exception:
-        logger.exception("处理 /chat 请求时出错 user=%s", user)
+        pipeline: MessagePipeline = request.app[PIPELINE]
+        frame = _frame_from_request(message, user, session_id)
+
+        try:
+            reply = await pipeline.handle(frame)
+        except Exception:
+            logger.exception("处理 /chat 请求时出错 user=%s", user)
+            return web.json_response(
+                {"error": _m("服务端处理出错，请查看日志", "Server error while processing, check the logs")},
+                status=500,
+            )
+
         return web.json_response(
-            {"error": "服务端处理出错，请查看日志"}, status=500
+            {"reply": reply.text, "kind": reply.kind, "session_id": session_id}
         )
-
-    return web.json_response(
-        {"reply": reply.text, "kind": reply.kind, "session_id": session_id}
-    )
+    finally:
+        reset_message_lang(token)
 
 
 async def _handle_health(request: web.Request) -> web.Response:

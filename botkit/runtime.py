@@ -270,27 +270,40 @@ def build_pipeline(config: BotConfig) -> tuple[MessagePipeline, BotEngine]:
     return MessagePipeline(config, engine, sessions, hooks), engine
 
 
-async def _start_chat_api(config: BotConfig, pipeline: MessagePipeline) -> Any:
-    """在当前事件循环里起 chat HTTP 服务，返回 AppRunner 供收尾时清理。"""
+async def _start_chat_api(
+    config: BotConfig, pipeline: MessagePipeline, port: int | None = None
+) -> Any:
+    """
+    在当前事件循环里起 chat HTTP 服务，返回 AppRunner 供收尾时清理。
+
+    port 为 None 时用 config.api.port；传了就用传入的端口（不改 config 本身）。
+    用于同一份 bot 配置在不同端口起多份实例（多进程负载均衡）。
+    """
     from aiohttp import web
 
     from botkit.api_server import create_api_app
 
+    listen_port = config.api.port if port is None else port
     app = create_api_app(config, pipeline, hooks=pipeline.hooks)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=config.api.port)
+    site = web.TCPSite(runner, host="0.0.0.0", port=listen_port)
     await site.start()
     logger.info(
         "chat 接口已启动：POST http://0.0.0.0:%d/chat（鉴权：%s）",
-        config.api.port,
+        listen_port,
         "Bearer token" if config.api.token else "无",
     )
     return runner
 
 
-def serve_chat_api(config: BotConfig) -> None:
-    """只起 chat HTTP 接口，不连企微。用于纯 API 部署（对接 Dify/门户）。"""
+def serve_chat_api(config: BotConfig, port: int | None = None) -> None:
+    """
+    只起 chat HTTP 接口，不连企微。用于纯 API 部署（对接 Dify/门户）。
+
+    port 为 None 时用 config.api.port；传了就覆盖监听端口（不改 config）。
+    让同一份 bot 配置能在不同端口起多份实例，供 Nginx 等做多进程负载均衡。
+    """
     setup_logging(config.name, config.log_level)
     pipeline, engine = build_pipeline(config)
 
@@ -301,7 +314,7 @@ def serve_chat_api(config: BotConfig) -> None:
                 config.session.scope, config.session.max_turns, config.session.ttl_seconds)
 
     async def main() -> None:
-        runner = await _start_chat_api(config, pipeline)
+        runner = await _start_chat_api(config, pipeline, port=port)
         try:
             await asyncio.Event().wait()  # 挂住直到取消
         finally:

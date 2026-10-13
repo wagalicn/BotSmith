@@ -42,7 +42,43 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_api_port(cli_port: int | None, env: dict[str, str], config_port: int) -> int:
+    """
+    决定对外 chat 接口监听哪个端口。优先级（高到低）：
+
+        --port（命令行显式传）  >  BOTKIT_API_PORT（环境变量）  >  bot.yaml 的 api.port
+
+    让同一份 bot 配置能在不同端口起多份实例（多进程负载均衡），不用拷贝多份 yaml。
+    非法端口（非数字、不在 1..65535）抛 ValueError，由调用方转成友好报错。
+    """
+    def _check(value: int, source: str) -> int:
+        if not (1 <= value <= 65535):
+            raise ValueError(
+                f"{source} 的端口 {value} 不合法，必须在 1..65535 之间 / "
+                f"invalid port {value} from {source}, must be in 1..65535"
+            )
+        return value
+
+    if cli_port is not None:
+        return _check(cli_port, "--port")
+
+    env_port = env.get("BOTKIT_API_PORT")
+    if env_port is not None and env_port.strip():
+        try:
+            parsed = int(env_port.strip())
+        except ValueError:
+            raise ValueError(
+                f"环境变量 BOTKIT_API_PORT={env_port!r} 不是整数 / "
+                f"environment variable BOTKIT_API_PORT={env_port!r} is not an integer"
+            ) from None
+        return _check(parsed, "BOTKIT_API_PORT")
+
+    return config_port
+
+
 def _cmd_serve_api(args: argparse.Namespace) -> int:
+    import os
+
     from botkit.runtime import serve_chat_api
 
     try:
@@ -60,7 +96,13 @@ def _cmd_serve_api(args: argparse.Namespace) -> int:
         )
         return 1
 
-    serve_chat_api(cfg)
+    try:
+        port = resolve_api_port(args.port, dict(os.environ), cfg.api.port)
+    except ValueError as e:
+        print(f"端口无效：{e}", file=sys.stderr)
+        return 1
+
+    serve_chat_api(cfg, port=port)
     return 0
 
 
@@ -156,6 +198,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="只启动对外 chat 接口（不连企微，用于对接 Dify / 门户）",
     )
     p_api.add_argument("bot_dir", help="Agent 目录（里面有 bot.yaml）")
+    p_api.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "覆盖监听端口。优先级：--port > 环境变量 BOTKIT_API_PORT > bot.yaml 的 api.port。"
+            "同一份配置起多实例时，各进程用不同 --port 即可（无需拷贝多份 yaml）"
+        ),
+    )
     p_api.set_defaults(func=_cmd_serve_api)
 
     p_new = sub.add_parser("new", help="生成一个新 Agent 骨架")

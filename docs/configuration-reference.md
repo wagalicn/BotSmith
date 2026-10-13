@@ -124,6 +124,28 @@ python -m botkit run bots/your-bot
 python -m botkit serve-api bots/your-bot
 ```
 
+**Overriding the listening port** (for running multiple instances behind a load balancer):
+
+The port comes from three sources, highest priority first:
+
+```
+--port CLI argument  >  BOTKIT_API_PORT environment variable  >  api.port in bot.yaml
+```
+
+```bash
+# Same bot config, multiple instances, each on its own port (for multi-process load balancing via Nginx, etc.)
+python -m botkit serve-api bots/your-bot --port 9003
+python -m botkit serve-api bots/your-bot --port 9004
+
+# Or use the environment variable (handy for injecting a port uniformly in containers/orchestration)
+set BOTKIT_API_PORT=9003 && python -m botkit serve-api bots/your-bot   REM Windows
+BOTKIT_API_PORT=9003 python -m botkit serve-api bots/your-bot          # macOS/Linux
+```
+
+- Without `--port` and without `BOTKIT_API_PORT`, it uses `api.port` from `bot.yaml` (same as before).
+- An invalid port (not an integer, or outside 1..65535) errors out directly, it won't silently bind a weird port.
+- The override only affects this one startup and does not change `bot.yaml` —— so **you don't need to copy a config per instance**.
+
 **API contract**:
 
 ```

@@ -20,26 +20,43 @@
 - **技能(skill)**：共享目录 `bots/_skills/*.md`，bot 勾选引用，启用后拼进系统提示词。
 - **导入/导出**：bot 配置可导出成 JSON（脱敏、不含密钥）、导入建新 bot。
 - **密钥集中**：LLM 三项、MCP 地址/请求头、chat token 都走「明文填页面 → 占位符进 yaml → 值落 .env」。
+- **多语言(i18n)**：配置页面 + 后端面向用户文案已中英双语（见下方第 6 项，已完成）。
+- **门户防返工改造（已落地）**：`SessionStore` 已抽象成接口、`register_routes`/`create_api_app`
+  已支持 `base_path` 前缀（见第 1 项说明）。为后续多 bot 网关、Redis 外置状态留好了口子。
 
 ---
 
 ## 待做（按优先级）
 
-### 1. 一进程挂多个 bot（多 bot API 网关）
+### 1. 一进程挂多个 bot（多 bot API 网关）  —— 未做（地基已就位）
 **为什么**：门户后面会有一堆 bot，一个 bot 一个进程/端口不好管。
 **做成什么**：
 - `python -m botkit serve-api bots/`（指向整个 bots 目录，扫描所有开了 `api.enabled` 的 bot）。
 - 路由改成 `POST /chat/<botname>`，一个端口服务多个 bot。
 - `GET /bots` 返回可用 bot 列表（名字、简介、是否在线）。
 **注意**：各 bot 的 SessionStore、引擎要隔离；一个 bot 配置坏了不能拖垮整个网关。
+**现状（2026-10）**：
+- ✅ 防返工前置已完成：`SessionStore` 已是接口（`session.py`，内存实现 + 预留 Redis）；
+  `register_routes` / `create_api_app` 已支持 `base_path`（`hooks.py` / `api_server.py`）。
+- ⬜ 还没做的实际网关部分：
+  - `cli.py` 的 `serve-api` 只接单个 `bot_dir`；`runtime.serve_chat_api(config)` 单 bot。
+  - `create_api_app(config, pipeline, ...)` 只挂一个 bot 的裸 `POST /chat`，还不是 `/chat/<botname>`。
+  - 没有 `GET /bots` 列表端点；没有「扫描 bots/ 目录、为每个在线 bot 各建一套 pipeline/engine/store」的组装层。
+  - `build_pipeline(config)` 是单 bot 组装，网关需要一个「{botname: pipeline}」的多实例管理。
 
-### 2. 流式回复（SSE）
+### 2. 流式回复（SSE）  —— 未做（接入点已就位）
 **为什么**：聊天窗要「打字机」效果，等一整段返回体验差。
 **做成什么**：`POST /chat` 支持 `Accept: text/event-stream`，逐段推 token。
 **复用**：`pipeline.handle` 已有 `on_progress` 回调，可作为流式推送的接入点；
 或在 engine 的 function calling 循环里加增量回调。
+**现状（2026-10）**：
+- ✅ `pipeline.handle(frame, on_progress=..., on_tool_call=...)` 已有回调，engine 循环已透传
+  `on_progress`（企微那边已用它推进度消息）。
+- ⬜ `api_server.py` 的 `/chat` 仍是一次性 `web.json_response`，没有 SSE 分支；
+  真正的「逐 token 增量」还需要 LLM 后端支持流式输出（当前 `backend.complete` 是整段返回），
+  这块要先确认两个后端能不能流式，再决定是走 token 级还是「进度+整段」级 SSE。
 
-### 3. bot 注册表 + 聚合门户页（「ITbot 大全」）
+### 3. bot 注册表 + 聚合门户页（「ITbot 大全」）  —— 未做
 **为什么**：给同事一个入口，列出所有 bot，点进去就能聊。
 **做成什么**：
 - 注册表：`registry.json` 或扫描 `bots/` 自动生成（名字、图标、简介、接口地址）。
@@ -48,34 +65,39 @@
   生成 `session_id` 并持久化。bot 侧的 SessionStore 只是短期上下文缓存，不负责会话生命周期。
 **边界**：门户是独立项目/服务，bot 框架这边只需提供稳定的 `/chat` 契约。
 
-### 4. 入口形态
+### 4. 入口形态  —— 未做
 - 桌面宠物 / 快捷方式 / 企微侧边栏：本质都是「打开门户 URL」的壳，不含 AI 逻辑。
 - 优先级最低，等门户页稳定后再做。
 
-### 5. 打包发布
+### 5. 打包发布  —— 未做
 - 现在靠源码目录 + `pip install -r requirements.txt`。
 - 可选：`pyproject.toml` 打 wheel，或 PyInstaller 打 exe，方便分发。
 
-### 6. 多语言支持（中 / 英，i18n）
-**为什么**：框架要开源，面向非中文用户也能用。当前所有界面与提示都是中文硬编码。
-**范围**：配置页面 UI + 后端返回给用户的提示文案，都要双语（中文 zh-CN / 英文 en）。
-不含：各 Agent 的对话文案（`bot.yaml` 的 `messages`，那是用户自填的业务内容，不由框架翻译）。
-**做成什么**：
-- **前端（无构建约束）**：自研极简 i18n，不引 i18next 这类需打包的重库（保持「拿到目录就能跑」）。
-  - 抽词条：`index.html` 用 `data-i18n="key"`，`app.js` 用 `t("key")` 取文案，替换掉现有硬编码中文。
-  - 语言包：`static/i18n/zh-CN.json`、`static/i18n/en.json`（`{key: 文案}`）。
-  - 顶栏加语言切换器；选择存 `localStorage`，默认跟随浏览器语言，回退 zh-CN。
-  - 切换后走现有 `render()` 重渲染即可生效。
-- **后端**：面向用户的中文串（`config.py` 的 `MessagesConfig` 默认值、`ConfigError`、`ui/service.py` 的
-  `UiError`、`scaffold.py` 的 `ScaffoldError`、`api_server` 的错误响应等）国际化。
-  - 推荐：后端返回**错误码 + 参数**，由前端按语言包映射文案（前后端只维护一份词条，最省事）；
-    或后端按请求语言（`Accept-Language`）返回对应文案。二选一，开工前定。
-**注意**：
-- 词条抽取是主要工作量（UI 中文串约一两百处），框架逻辑几乎不动。
-- 企微后台真实菜单名（如「智能机器人 → API模式 → 长连接」）是操作指引，英文包里应保留中文原名或加注，别硬译成用户在企微后台找不到的词。
-- 与「机器人→Agent」的品牌统一保持一致：中英文包都用 "Agent"（不再出现「机器人」，企微产品名除外）。
-- 测试里对中文错误串的断言（如 `找不到这个 Agent`）在改成错误码后要同步更新。
-**独立性**：纯 UI/文案工程，与门户主线（1–4 项）无依赖，可随时插入。
+### 6. 多语言支持（中 / 英，i18n）  —— ✅ 已完成（2026-10）
+**为什么**：框架要开源，面向非中文用户也能用。
+**范围**：配置页面 UI + 后端返回给用户的提示文案，中英双语。
+不含：各 Agent 的对话文案（`bot.yaml` 的 `messages`，用户自填的业务内容，不由框架翻译）。
+**实际做法**（最终落地，与开工前设想略有调整）：
+- **前端**：自研极简 i18n，无构建步骤。
+  - `static/i18n.js`：内置 `{zh, en}` 字典 + `t("key")` + `applyStaticI18n()`（填充 `data-i18n`）
+    + `translateOption()`（翻译后端返回的 options label/note）。语言存 `localStorage`。
+  - `index.html` 用 `data-i18n` 标注静态文案；`app.js` 全量用 `t()`；顶栏有中/EN 切换按钮，
+    切换后重填静态 DOM + `render()` 重渲染，并对当前 bot 重新校验以刷新报错横幅/摘要。
+  - 词典内置在 `i18n.js` 里（没拆成独立 json 文件），一样零构建、改一个文件即可。
+- **后端**：没有走「错误码 + 参数」，而是**按请求 `Accept-Language` 返回对应语言文案**。
+  - `config.py`：引入语言 `ContextVar`（默认 `zh`）+ `_m(zh, en)` 辅助 + `set/reset/get_message_lang`；
+    所有 `ConfigError`、缺环境变量提示、`config_summary`（新增英文版）双语。
+  - `ui/service.py`、`scaffold.py`、`api_server.py`：各自的 `UiError` / `ScaffoldError` / `/chat` 错误响应双语
+    （复用同一个 ContextVar）。
+  - `ui/server.py`：`lang_middleware` 按 `Accept-Language` 设/恢复语言；`api_server` 的 `/chat` 同样按头切换。
+  - 前端 `api()` 请求带 `Accept-Language` 跟随界面语言。
+- **关键保证**：CLI（`botkit validate/run/new`）和运行时不设置语言 → 永远中文，行为完全不变。
+**已覆盖的后端文案**：`config.py` 全部 ConfigError + config_summary、`ui/service.py` 的 UiError、
+`scaffold.py` 的 ScaffoldError、`api_server.py` 的 /chat 错误、`prompt_check` 的检查项（前端按 key 翻译）。
+**测试**：新增中文默认 / `Accept-Language: en` 报错英文 / 摘要英文标签等用例；全套 pytest 全绿。
+**遗留（可选，优先级低）**：
+- 企微后台真实菜单名（如「智能机器人 → API模式 → 长连接」）是操作指引，英文文案里保留了中文原名/加注，没硬译。
+- `runtime.py` 等纯日志（给运维看、不直接面向终端用户）仍是中文，未纳入 i18n 范围。
 
 ---
 
