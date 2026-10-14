@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, AsyncIterator, Protocol
 
 logger = logging.getLogger("botkit.llm")
 
@@ -49,6 +49,24 @@ class LlmResponse:
         return bool(self.tool_calls)
 
 
+@dataclass
+class StreamChunk:
+    """
+    流式补全的一个片段（SSE 用）。
+
+    一次 stream() 调用会先 yield 若干个带 delta 的 chunk（文本增量，done=False），
+    最后 yield 一个 done=True 的 chunk，并在 response 里带上整轮聚合好的
+    LlmResponse（含完整 content 和 tool_calls）。
+
+    这样调用方（engine）既能实时拿到文本增量做打字机效果，又能在收尾时像
+    非流式 complete 一样判断这一轮是不是要调工具（response.wants_tools）。
+    """
+
+    delta: str = ""
+    done: bool = False
+    response: LlmResponse | None = None
+
+
 class LlmBackend(Protocol):
     """所有后端都要实现这个"""
 
@@ -60,6 +78,18 @@ class LlmBackend(Protocol):
         """
         跑一次补全。失败必须抛 LlmError（而不是返回 None），
         让上层能区分「模型说没工具要调」和「根本没调通」。
+        """
+        ...
+
+    def stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[StreamChunk]:
+        """
+        流式补全（SSE 用）。返回一个异步迭代器，先吐若干文本增量 chunk，
+        最后吐一个 done=True 的 chunk（带整轮聚合好的 LlmResponse）。
+
+        失败同样抛 LlmError。工具调用轮通常没有文本增量，done chunk 的
+        response.wants_tools 为真，由上层决定执行工具后再开下一轮流式。
         """
         ...
 
@@ -144,3 +174,69 @@ def normalize_response(
         tool_calls=tool_calls,
         message=build_assistant_message(content, tool_calls),
     )
+
+
+# --------------------------------------------------------------------------
+# 流式聚合：把增量到达的文本和 tool_calls 片段拼成完整的 LlmResponse
+# --------------------------------------------------------------------------
+
+
+class StreamAccumulator:
+    """
+    流式响应里，文本和 tool_calls 都是一小段一小段到达的。这个累加器把它们
+    按到达顺序拼起来，结束时产出和非流式 complete 完全一致的 LlmResponse。
+
+    tool_calls 的增量按 index 归位：同一个 index 的多个片段，name 取第一个
+    非空的，arguments 字符串按到达顺序拼接。这是 OpenAI 流式 tool_calls 的
+    标准增量形态，两个后端都复用这套逻辑。
+    """
+
+    def __init__(self) -> None:
+        self._text_parts: list[str] = []
+        # index -> {"id": str, "name": str, "arguments": str}
+        self._tool_calls: dict[int, dict[str, str]] = {}
+
+    def add_text(self, delta: str | None) -> str:
+        """累加一段文本增量，返回这段增量（空则返回空串，便于调用方直接推送）"""
+        if not delta:
+            return ""
+        self._text_parts.append(delta)
+        return delta
+
+    def add_tool_call_delta(
+        self,
+        index: int,
+        *,
+        call_id: str | None = None,
+        name: str | None = None,
+        arguments: str | None = None,
+    ) -> None:
+        """累加一个 tool_call 增量片段（按 index 归位）"""
+        slot = self._tool_calls.setdefault(
+            index, {"id": "", "name": "", "arguments": ""}
+        )
+        if call_id:
+            slot["id"] = call_id
+        if name:
+            slot["name"] = name
+        if arguments:
+            slot["arguments"] += arguments
+
+    @property
+    def text(self) -> str:
+        return "".join(self._text_parts)
+
+    def finish(self) -> LlmResponse:
+        """把累积的内容拼成和非流式 complete 一致的 LlmResponse"""
+        raw_tool_calls = [
+            {
+                "id": self._tool_calls[idx]["id"],
+                "function": {
+                    "name": self._tool_calls[idx]["name"],
+                    "arguments": self._tool_calls[idx]["arguments"],
+                },
+            }
+            for idx in sorted(self._tool_calls)
+        ]
+        content = self.text or None
+        return normalize_response(content, raw_tool_calls)

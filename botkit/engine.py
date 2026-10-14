@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from botkit.config import BotConfig, ContentWatcher
 from botkit.hooks import HookContext, Hooks
@@ -152,53 +152,145 @@ class BotEngine:
                     logger.info("第 %d 轮得到最终回复（%d 字）", round_i, len(reply))
                     return reply
 
-                # 有工具调用，先把 assistant 消息放进上下文
-                assistant_message = resp.message
-                messages.append(assistant_message)
-
-                for index, tc in enumerate(resp.tool_calls):
-                    args = dict(tc.arguments)
-
-                    # 安全边界：可信身份覆盖 LLM 生成的值
-                    for arg_name in self.config.inject_for(tc.name):
-                        if args.get(arg_name) not in (None, "", identity):
-                            logger.warning(
-                                "LLM 给工具 %s 的 %s 传了 %r，已用可信身份 %r 覆盖",
-                                tc.name,
-                                arg_name,
-                                args.get(arg_name),
-                                identity,
-                            )
-                        args[arg_name] = identity
-
-                    args = await self.hooks.before_tool_call(tc.name, args, ctx)
-
-                    # 参数被改过就同步回 assistant 消息，让上下文里记录的调用
-                    # 和实际发出的调用一致。否则模型会在自己的历史里看到
-                    # 被覆盖掉的旧参数（比如伪造的工号），可能照着它回答用户。
-                    if args != tc.arguments:
-                        _sync_tool_call_args(assistant_message, index, args)
-
-                    if on_progress:
-                        await on_progress(self.config.messages.progress_for(tc.name))
-
-                    result = await sess.call_tool(tc.name, args)
-                    result = await self.hooks.after_tool_call(tc.name, result, ctx)
-
-                    if on_tool_call:
-                        await on_tool_call(tc.name, args, result)
-
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result,
-                        }
-                    )
+                # 有工具调用：身份注入、hook 改写、调用并回灌结果
+                await self._execute_tool_calls(
+                    sess, resp, messages, identity, ctx, on_progress, on_tool_call
+                )
 
         # 轮次用完还没给出文本回复，通常是模型在反复调工具打转
         logger.warning("工具调用轮次达到上限 %d，放弃本轮", max_rounds)
         return self.config.messages.tool_rounds_exceeded
+
+    async def chat_stream(
+        self,
+        user_message: str,
+        identity: str | None,
+        history: list[dict[str, str]] | None = None,
+        on_progress: ProgressCallback | None = None,
+        hook_context: HookContext | None = None,
+        on_tool_call: ToolCallObserver | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        chat 的流式版本：逐段 yield 最终回复的文本增量（打字机效果）。
+
+        和 chat 的行为完全一致（同样的身份校验、system prompt、工具循环、
+        身份注入、hook），区别只在产出文本时用 backend.stream 逐 token 吐出。
+        工具调用轮本身不是给用户看的文本，不往外 yield；进度仍走 on_progress
+        回调。轮次耗尽时 yield 一句 tool_rounds_exceeded 文案作为收尾。
+
+        与 chat 一样：LLM 调不通抛 LlmError，MCP 连不上抛 McpError。
+        注意：一旦开始 yield 文本后再抛异常，调用方会收到半截输出——但空回复
+        （没 yield 过任何 token）时才会抛 LlmError，所以不会出现「推了一半又报错」。
+        """
+        pattern = self.config.identity.pattern
+        if not identity_matches(identity, pattern):
+            raise IdentityRejected(identity, pattern or "")
+
+        ctx = hook_context or HookContext(
+            identity=identity, config=self.config, logger=logger
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.build_system_prompt(identity)}
+        ]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
+        max_rounds = self.config.llm.max_tool_rounds
+
+        async with self.mcp.session(identity=identity) as sess:
+            tools = await sess.list_tools_openai()
+
+            for round_i in range(1, max_rounds + 1):
+                logger.debug("第 %d/%d 轮请求 LLM（流式）", round_i, max_rounds)
+
+                produced = ""
+                resp = None
+                async for chunk in self.backend.stream(messages, tools):
+                    if chunk.done:
+                        resp = chunk.response
+                        break
+                    if chunk.delta:
+                        produced += chunk.delta
+                        yield chunk.delta
+
+                if resp is None:
+                    raise LlmError("流式返回没有收尾（缺少 done 片段）")
+
+                if not resp.wants_tools:
+                    # 这一轮是最终答复
+                    if not produced.strip() and not (resp.content or "").strip():
+                        logger.warning("LLM 既没有工具调用也没有文本回复")
+                        raise LlmError("LLM 返回了空回复")
+                    logger.info("第 %d 轮得到最终回复（流式）", round_i)
+                    return
+
+                # 工具调用轮：和 chat 完全一样地处理
+                await self._execute_tool_calls(
+                    sess, resp, messages, identity, ctx, on_progress, on_tool_call
+                )
+
+        logger.warning("工具调用轮次达到上限 %d，放弃本轮", max_rounds)
+        yield self.config.messages.tool_rounds_exceeded
+
+    async def _execute_tool_calls(
+        self,
+        sess: Any,
+        resp: Any,
+        messages: list[dict[str, Any]],
+        identity: str | None,
+        ctx: HookContext,
+        on_progress: ProgressCallback | None,
+        on_tool_call: ToolCallObserver | None,
+    ) -> None:
+        """
+        处理一轮工具调用：把 assistant 消息入上下文，对每个 tool_call 做身份
+        强制注入、hook 改写、参数同步，调用工具并把结果回灌进 messages。
+
+        chat 和 chat_stream 共用这段逻辑，确保两条路径行为完全一致。
+        """
+        assistant_message = resp.message
+        messages.append(assistant_message)
+
+        for index, tc in enumerate(resp.tool_calls):
+            args = dict(tc.arguments)
+
+            # 安全边界：可信身份覆盖 LLM 生成的值
+            for arg_name in self.config.inject_for(tc.name):
+                if args.get(arg_name) not in (None, "", identity):
+                    logger.warning(
+                        "LLM 给工具 %s 的 %s 传了 %r，已用可信身份 %r 覆盖",
+                        tc.name,
+                        arg_name,
+                        args.get(arg_name),
+                        identity,
+                    )
+                args[arg_name] = identity
+
+            args = await self.hooks.before_tool_call(tc.name, args, ctx)
+
+            # 参数被改过就同步回 assistant 消息，让上下文里记录的调用
+            # 和实际发出的调用一致。
+            if args != tc.arguments:
+                _sync_tool_call_args(assistant_message, index, args)
+
+            if on_progress:
+                await on_progress(self.config.messages.progress_for(tc.name))
+
+            result = await sess.call_tool(tc.name, args)
+            result = await self.hooks.after_tool_call(tc.name, result, ctx)
+
+            if on_tool_call:
+                await on_tool_call(tc.name, args, result)
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                }
+            )
 
     async def aclose(self) -> None:
         await self.backend.aclose()

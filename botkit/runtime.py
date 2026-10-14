@@ -16,7 +16,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from botkit.config import BotConfig, DiscoveredBot, discover_api_bots
 from botkit.engine import BotEngine, IdentityRejected, identity_matches
@@ -58,6 +58,16 @@ class Reply:
 
     text: str
     kind: str
+
+
+@dataclass
+class _Prepared:
+    """前置流程（身份/空/重置/拦截）通过后，进 LLM 需要的上下文"""
+
+    identity: str
+    content: str
+    ctx: "HookContext"
+    session_key: str
 
 
 class MessagePipeline:
@@ -109,19 +119,15 @@ class MessagePipeline:
 
         return self.wecom_userid(frame)
 
-    # -- 主流程 ------------------------------------------------------------
+    # -- 前置流程（流式/非流式共用）----------------------------------------
 
-    async def handle(
-        self,
-        frame: dict[str, Any],
-        on_progress: ProgressCallback | None = None,
-        on_tool_call: ToolCallObserver | None = None,
-    ) -> Reply:
+    async def _prepare(
+        self, frame: dict[str, Any]
+    ) -> tuple[Reply | None, _Prepared | None]:
         """
-        处理一条文本消息，返回该发给用户的内容。
-
-        这个方法不抛异常：任何问题都转成 messages.error 的回复，
-        Agent宁可说"出错了"也不能装死。
+        进 LLM 之前的通用处理：身份解析校验、空消息、重置指令、配置拦截、
+        hook 拦截。命中任何一条就返回 (提前回复 Reply, None)；全部通过就返回
+        (None, _Prepared)。handle 和 handle_stream 共用，保证两条路径前置行为一致。
         """
         body = frame.get("body") or {}
         raw_userid = self.wecom_userid(frame)
@@ -139,11 +145,6 @@ class MessagePipeline:
         )
 
         # 1. 身份解析与校验
-        #
-        # 这里有两种失败，要分开看：
-        #   identity is None  解析失败（hook 没给出身份），无论有没有配
-        #                     pattern 都必须拒绝 —— 我们根本不知道是谁在说话
-        #   格式不匹配        配了 pattern 才判，比如工号形如 L220104
         identity = await self.resolve_identity(frame)
         if identity is None:
             logger.warning(
@@ -151,7 +152,7 @@ class MessagePipeline:
                 raw_userid,
                 self.config.identity.source,
             )
-            return Reply(msgs.identity_invalid, KIND_IDENTITY_INVALID)
+            return Reply(msgs.identity_invalid, KIND_IDENTITY_INVALID), None
 
         if not identity_matches(identity, self.config.identity.pattern):
             logger.warning(
@@ -160,7 +161,7 @@ class MessagePipeline:
                 identity,
                 self.config.identity.pattern,
             )
-            return Reply(msgs.identity_invalid, KIND_IDENTITY_INVALID)
+            return Reply(msgs.identity_invalid, KIND_IDENTITY_INVALID), None
 
         ctx = HookContext(
             identity=identity,
@@ -172,26 +173,59 @@ class MessagePipeline:
 
         # 2. 空消息
         if not content:
-            return Reply(msgs.empty_input, KIND_EMPTY)
+            return Reply(msgs.empty_input, KIND_EMPTY), None
 
         # 3. 重置指令
         if content in msgs.reset_keywords:
             self.sessions.clear(session_key)
             logger.info("已清空会话 %s", session_key)
-            return Reply(msgs.reset_done, KIND_RESET)
+            return Reply(msgs.reset_done, KIND_RESET), None
 
         # 4. 配置式前置拦截：命中 intercepts 规则就直接回固定文案，不进 LLM。
-        #    先于 hook 执行 —— 配置是常规手段，hook 是逃生舱。
         for rule in self.config.intercepts:
             if rule.hit(content):
                 logger.info("命中 intercepts 规则，未进入 LLM：%s", content)
-                return Reply(rule.reply, KIND_INTERCEPT)
+                return Reply(rule.reply, KIND_INTERCEPT), None
 
-        # 5. hook 前置拦截：命中就不进 LLM，省 token 也更快
+        # 5. hook 前置拦截：命中就不进 LLM
         intercepted = await self.hooks.on_message(content, ctx)
         if intercepted is not None:
             logger.info("on_message hook 拦截了本条消息，未进入 LLM")
-            return Reply(intercepted, KIND_HOOK)
+            return Reply(intercepted, KIND_HOOK), None
+
+        return None, _Prepared(
+            identity=identity,
+            content=content,
+            ctx=ctx,
+            session_key=session_key,
+        )
+
+    # -- 主流程 ------------------------------------------------------------
+
+    async def handle(
+        self,
+        frame: dict[str, Any],
+        on_progress: ProgressCallback | None = None,
+        on_tool_call: ToolCallObserver | None = None,
+    ) -> Reply:
+        """
+        处理一条文本消息，返回该发给用户的内容。
+
+        这个方法不抛异常：任何问题都转成 messages.error 的回复，
+        Agent宁可说"出错了"也不能装死。
+        """
+        msgs = self.config.messages
+
+        # 1-5. 身份校验 / 空消息 / 重置 / 拦截（和流式共用一套前置逻辑）
+        early, prepared = await self._prepare(frame)
+        if early is not None:
+            return early
+        assert prepared is not None  # early 为 None 时 prepared 必非空
+        identity = prepared.identity
+        content = prepared.content
+        ctx = prepared.ctx
+        session_key = prepared.session_key
+        raw_userid = self.wecom_userid(frame)
 
         # 6. 进 LLM
         if on_progress:
@@ -237,6 +271,89 @@ class MessagePipeline:
             self.sessions.turn_count(session_key),
         )
         return Reply(reply, KIND_LLM)
+
+    async def handle_stream(
+        self,
+        frame: dict[str, Any],
+        on_progress: ProgressCallback | None = None,
+        on_tool_call: ToolCallObserver | None = None,
+    ) -> AsyncIterator[tuple[str, str]]:
+        """
+        handle 的流式版本（SSE 用）。逐段 yield (kind, text_piece)。
+
+        前置流程（身份/空/重置/拦截）和 handle 完全一致——命中时作为单段
+        yield 出去（kind 为对应类型，如 identity_invalid/empty_input/reset/
+        intercept/hook）；真正进 LLM 时逐 token yield (KIND_LLM, token)。
+
+        和 handle 一样不抛异常：进 LLM 阶段出错转成一段 (KIND_ERROR, 文案)。
+        reply_suffix / before_reply / 存历史 在流结束时统一处理（基于累积的
+        完整文本），语义和 handle 对齐。
+        """
+        msgs = self.config.messages
+
+        early, prepared = await self._prepare(frame)
+        if early is not None:
+            yield early.kind, early.text
+            return
+        assert prepared is not None
+        identity = prepared.identity
+        content = prepared.content
+        ctx = prepared.ctx
+        session_key = prepared.session_key
+        raw_userid = self.wecom_userid(frame)
+
+        if on_progress:
+            await on_progress(msgs.thinking)
+
+        history = self.sessions.get_history(session_key)
+
+        parts: list[str] = []
+        try:
+            async for piece in self.engine.chat_stream(
+                content,
+                identity=identity,
+                history=history,
+                on_progress=on_progress,
+                hook_context=ctx,
+                on_tool_call=on_tool_call,
+            ):
+                if piece:
+                    parts.append(piece)
+                    yield KIND_LLM, piece
+        except IdentityRejected:
+            logger.exception("引擎拒绝了身份，这不该发生")
+            yield KIND_IDENTITY_INVALID, msgs.identity_invalid
+            return
+        except BaseExceptionGroup as eg:
+            _log_exception_group(eg)
+            # 若已经吐了部分 token，这里再追加一段错误文案；否则就是一整段错误
+            yield KIND_ERROR, msgs.error
+            return
+        except Exception:
+            logger.exception("流式处理消息时出错")
+            yield KIND_ERROR, msgs.error
+            return
+
+        reply = "".join(parts)
+
+        # 配置式回复加工 + before_reply hook：和 handle 对齐。
+        # 注意这些加工只影响「存进历史」和尾部补充，不改已经吐出去的 token。
+        suffix = msgs.reply_suffix
+        full = reply + suffix if (suffix and reply) else reply
+        full = await self.hooks.before_reply(full, ctx)
+
+        # 后缀/hook 追加的尾巴，补吐给客户端，保证流式看到的和存的一致
+        tail = full[len(reply):] if full.startswith(reply) else ""
+        if tail:
+            yield KIND_LLM, tail
+
+        self.sessions.append_turn(session_key, content, full)
+        logger.info(
+            "已流式回复 userid=%s，会话 %s 现有 %d 轮历史",
+            raw_userid,
+            session_key,
+            self.sessions.turn_count(session_key),
+        )
 
 
 def _log_exception_group(eg: BaseException) -> None:

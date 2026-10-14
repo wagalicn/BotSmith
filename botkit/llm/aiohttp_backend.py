@@ -14,13 +14,20 @@ choices 里少字段等。这些情况 openai 官方 SDK 会在 pydantic 校验�
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiohttp
 
 from botkit.config import LlmConfig
-from botkit.llm.base import LlmError, LlmResponse, normalize_response
+from botkit.llm.base import (
+    LlmError,
+    LlmResponse,
+    StreamAccumulator,
+    StreamChunk,
+    normalize_response,
+)
 
 logger = logging.getLogger("botkit.llm.aiohttp")
 
@@ -85,6 +92,56 @@ class AiohttpBackend:
 
         return _parse_openai_payload(data)
 
+    async def stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[StreamChunk]:
+        body: dict[str, Any] = {
+            "model": self.cfg.model,
+            "messages": messages,
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = tools
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.cfg.api_key}",
+        }
+
+        acc = StreamAccumulator()
+        session = await self._get_session()
+        try:
+            async with session.post(
+                self.cfg.api_url, headers=headers, json=body
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise LlmError(
+                        f"LLM 返回 HTTP {resp.status}：{text[:_ERROR_BODY_LIMIT]}"
+                    )
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", "replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(payload)
+                    except json.JSONDecodeError:
+                        logger.warning("流式分片不是合法 JSON，跳过：%s", payload[:200])
+                        continue
+                    for piece in _iter_stream_deltas(data, acc):
+                        yield piece
+        except LlmError:
+            raise
+        except aiohttp.ClientError as e:
+            raise LlmError(f"请求 LLM 失败（{type(e).__name__}）：{e}") from e
+        except TimeoutError as e:
+            raise LlmError(f"请求 LLM 超时（{self.cfg.timeout_seconds:g}s）") from e
+
+        yield StreamChunk(done=True, response=acc.finish())
+
     async def aclose(self) -> None:
         if self._session is not None and self._owns_session and not self._session.closed:
             await self._session.close()
@@ -126,3 +183,40 @@ def _parse_openai_payload(data: Any) -> LlmResponse:
         raw_tool_calls = []
 
     return normalize_response(content, [tc for tc in raw_tool_calls if isinstance(tc, dict)])
+
+
+def _iter_stream_deltas(data: Any, acc: StreamAccumulator):
+    """
+    从一个流式分片（OpenAI 兼容的 chat.completion.chunk）里取出增量，
+    喂进累加器，并把文本增量作为 StreamChunk 产出。
+
+    结构：{"choices": [{"delta": {"content": "...", "tool_calls": [...]}}]}
+    对不规范结构做防御，坏分片直接跳过（这正是裸 HTTP 后端存在的意义）。
+    """
+    if not isinstance(data, dict):
+        return
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        return
+    first = choices[0]
+    if not isinstance(first, dict):
+        return
+    delta = first.get("delta")
+    if not isinstance(delta, dict):
+        return
+
+    text = delta.get("content")
+    if isinstance(text, str) and text:
+        acc.add_text(text)
+        yield StreamChunk(delta=text)
+
+    for i, tc in enumerate(delta.get("tool_calls") or []):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        acc.add_tool_call_delta(
+            tc.get("index", i) or 0,
+            call_id=tc.get("id"),
+            name=fn.get("name") if isinstance(fn, dict) else None,
+            arguments=fn.get("arguments") if isinstance(fn, dict) else None,
+        )

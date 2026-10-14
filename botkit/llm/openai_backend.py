@@ -13,10 +13,18 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from typing import AsyncIterator
+
 from openai import APIError, AsyncOpenAI, OpenAIError
 
 from botkit.config import LlmConfig
-from botkit.llm.base import LlmError, LlmResponse, normalize_response
+from botkit.llm.base import (
+    LlmError,
+    LlmResponse,
+    StreamAccumulator,
+    StreamChunk,
+    normalize_response,
+)
 
 logger = logging.getLogger("botkit.llm.openai")
 
@@ -75,6 +83,51 @@ class OpenAIBackend:
             )
 
         return normalize_response(msg.content, raw_tool_calls)
+
+    async def stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[StreamChunk]:
+        kwargs: dict[str, Any] = {
+            "model": self.cfg.model,
+            "messages": messages,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        acc = StreamAccumulator()
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+
+                text = getattr(delta, "content", None)
+                if text:
+                    acc.add_text(text)
+                    yield StreamChunk(delta=text)
+
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    fn = getattr(tc, "function", None)
+                    acc.add_tool_call_delta(
+                        getattr(tc, "index", 0) or 0,
+                        call_id=getattr(tc, "id", None),
+                        name=getattr(fn, "name", None) if fn else None,
+                        arguments=getattr(fn, "arguments", None) if fn else None,
+                    )
+        except APIError as e:
+            raise LlmError(
+                f"LLM 接口报错（{type(e).__name__}）：{getattr(e, 'message', str(e))}"
+            ) from e
+        except OpenAIError as e:
+            raise LlmError(f"调用 LLM 失败（{type(e).__name__}）：{e}") from e
+        except Exception as e:
+            raise LlmError(f"调用 LLM 时出现意外错误（{type(e).__name__}）：{e}") from e
+
+        yield StreamChunk(done=True, response=acc.finish())
 
     async def aclose(self) -> None:
         await self._client.close()

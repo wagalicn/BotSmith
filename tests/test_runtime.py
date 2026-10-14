@@ -85,6 +85,33 @@ class RecordingEngine:
             raise self._raises
         return self._reply
 
+    async def chat_stream(
+        self,
+        user_message,
+        identity,
+        history=None,
+        on_progress=None,
+        hook_context=None,
+        on_tool_call=None,
+    ):
+        self.calls.append(
+            {
+                "message": user_message,
+                "identity": identity,
+                "history": history,
+                "ctx": hook_context,
+                "on_tool_call": on_tool_call,
+                "stream": True,
+            }
+        )
+        if on_progress:
+            await on_progress("引擎的进度提示")
+        if self._raises:
+            raise self._raises
+        # 逐字吐，模拟流式
+        for ch in self._reply:
+            yield ch
+
     async def aclose(self):
         pass
 
@@ -821,3 +848,88 @@ async def test_reply_suffix_then_before_reply_hook():
     )
     reply = await pipeline.handle(frame("你好"))
     assert reply.text == "引擎的回复 [配置尾] [hook尾]"
+
+
+# --------------------------------------------------------------------------
+# handle_stream 流式（SSE 用）：前置流程和 handle 一致，LLM 段逐字 yield
+# --------------------------------------------------------------------------
+
+
+async def _collect_handle_stream(pipeline, frame_, **kwargs):
+    return [item async for item in pipeline.handle_stream(frame_, **kwargs)]
+
+
+async def test_handle_stream_yields_llm_tokens():
+    pipeline, _, sessions = make_pipeline(
+        engine=RecordingEngine(reply="你好呀"),
+        identity=IdentityConfig(pattern=None),
+    )
+    items = await _collect_handle_stream(pipeline, frame("hi"))
+    # 全是 KIND_LLM，拼起来是完整回复
+    assert all(kind == KIND_LLM for kind, _ in items)
+    assert "".join(text for _, text in items) == "你好呀"
+
+
+async def test_handle_stream_stores_history():
+    pipeline, _, sessions = make_pipeline(
+        engine=RecordingEngine(reply="记住我"),
+        identity=IdentityConfig(pattern=None),
+    )
+    f = frame("hi")
+    await _collect_handle_stream(pipeline, f)
+    # 存了历史，下一轮能接上
+    key = sessions.key_for(f)
+    history = sessions.get_history(key)
+    assert history[-1]["content"] == "记住我"
+
+
+async def test_handle_stream_empty_message():
+    pipeline, _, _ = make_pipeline(identity=IdentityConfig(pattern=None))
+    items = await _collect_handle_stream(pipeline, frame(""))
+    assert items == [(KIND_EMPTY, pipeline.config.messages.empty_input)]
+
+
+async def test_handle_stream_reset_keyword():
+    pipeline, _, _ = make_pipeline(identity=IdentityConfig(pattern=None))
+    items = await _collect_handle_stream(pipeline, frame("重新开始"))
+    assert items == [(KIND_RESET, pipeline.config.messages.reset_done)]
+
+
+async def test_handle_stream_identity_invalid():
+    pipeline, _, _ = make_pipeline(
+        identity=IdentityConfig(pattern=r"^[LM]\d{6}$")
+    )
+    items = await _collect_handle_stream(pipeline, frame("hi", userid="坏号"))
+    assert items == [(KIND_IDENTITY_INVALID, pipeline.config.messages.identity_invalid)]
+
+
+async def test_handle_stream_intercept():
+    pipeline, _, _ = make_pipeline(identity=IdentityConfig(pattern=None))
+    pipeline.config.intercepts = [Intercept(reply="拦截了", match=["你好"])]
+    items = await _collect_handle_stream(pipeline, frame("你好"))
+    assert items == [(KIND_INTERCEPT, "拦截了")]
+
+
+async def test_handle_stream_llm_error_becomes_error_event():
+    pipeline, _, _ = make_pipeline(
+        engine=RecordingEngine(raises=LlmError("炸了")),
+        identity=IdentityConfig(pattern=None),
+    )
+    items = await _collect_handle_stream(pipeline, frame("hi"))
+    assert items[-1] == (KIND_ERROR, pipeline.config.messages.error)
+
+
+async def test_handle_stream_reply_suffix_appended():
+    msgs = MessagesConfig(reply_suffix="\n—— 署名")
+    pipeline, _, sessions = make_pipeline(
+        engine=RecordingEngine(reply="正文"),
+        messages=msgs,
+        identity=IdentityConfig(pattern=None),
+    )
+    f = frame("hi")
+    items = await _collect_handle_stream(pipeline, f)
+    full = "".join(text for _, text in items)
+    # 流式输出里也带上了后缀
+    assert full == "正文\n—— 署名"
+    # 存历史也带后缀
+    assert sessions.get_history(sessions.key_for(f))[-1]["content"] == "正文\n—— 署名"
