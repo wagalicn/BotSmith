@@ -1717,10 +1717,16 @@ function renderPreview() {
       }
       box.append(trace);
     }
-    box.append(el("div", { class: "chat-bubble bot", text: turn.text }));
+    // 流式刚开始、还没来文本时 text 为空，不渲染空气泡
+    if (turn.text) {
+      box.append(el("div", { class: "chat-bubble bot", text: turn.text }));
+    }
   }
 
-  if (state.preview.busy) {
+  // 「正在处理」气泡：只在还没开始吐字时显示，避免和流式增长的气泡重复
+  const last = state.preview.turns[state.preview.turns.length - 1];
+  const streaming = last && last.role === "assistant" && last.text;
+  if (state.preview.busy && !streaming) {
     box.append(el("div", { class: "chat-bubble bot busy", text: t("preview.thinking") }));
   }
 
@@ -1746,17 +1752,61 @@ async function sendPreview() {
 
   const identity = $("#preview-identity").value.trim();
 
+  // 流式（SSE）预览：逐段把回复追加到这个 assistant turn，实时打字机。
+  const turn = { role: "assistant", text: "", tools: [] };
+  let turnPushed = false;
+  const ensureTurn = () => {
+    if (!turnPushed) {
+      state.preview.turns.push(turn);
+      turnPushed = true;
+    }
+  };
+
   try {
-    const result = await api("POST", `/api/bots/${encodeURIComponent(state.current)}/preview`, {
-      message,
-      history: state.preview.history,
-      identity: identity || undefined,
-    });
-    state.preview.history = result.history;
-    state.preview.turns.push({
-      role: "assistant",
-      text: result.reply,
-      tools: result.tool_calls,
+    const resp = await fetch(
+      `/api/bots/${encodeURIComponent(state.current)}/preview/stream`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "text/event-stream",
+          "Accept-Language": getLang() === "en" ? "en" : "zh",
+        },
+        body: JSON.stringify({
+          message,
+          history: state.preview.history,
+          identity: identity || undefined,
+        }),
+      }
+    );
+
+    // 开流前的错误（配置没过校验 / 身份不符）是普通 JSON 4xx
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try {
+        const err = await resp.json();
+        if (err && err.error) msg = err.error;
+      } catch (_) { /* 保留 HTTP 状态码 */ }
+      throw new Error(msg);
+    }
+
+    await readSse(resp, (event, data) => {
+      if (event === null && data && typeof data.delta === "string") {
+        ensureTurn();
+        turn.text += data.delta;
+        renderPreview();
+      } else if (event === "tool") {
+        ensureTurn();
+        turn.tools.push(data);
+        renderPreview();
+      } else if (event === "error") {
+        state.preview.turns.push({ role: "error", text: data.message || "出错了" });
+        renderPreview();
+      } else if (event === "done") {
+        if (data && Array.isArray(data.history)) {
+          state.preview.history = data.history;
+        }
+      }
     });
   } catch (e) {
     state.preview.turns.push({ role: "error", text: e.message });
@@ -1764,6 +1814,48 @@ async function sendPreview() {
     state.preview.busy = false;
     renderPreview();
   }
+}
+
+/** 读取一个 SSE 响应，逐事件回调 cb(event, data)。event 为 null 表示无名事件。 */
+async function readSse(resp, cb) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const flush = (block) => {
+    const trimmed = block.trim();
+    if (!trimmed) return;
+    let event = null;
+    let dataText = null;
+    for (const line of trimmed.split("\n")) {
+      if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        dataText = line.slice(5).trim();
+      }
+    }
+    if (dataText === null) return;
+    let data;
+    try {
+      data = JSON.parse(dataText);
+    } catch (_) {
+      return; // 坏分片跳过
+    }
+    cb(event, data);
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    // SSE 事件以空行（\n\n）分隔
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      flush(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 2);
+    }
+  }
+  if (buffer.trim()) flush(buffer);
 }
 
 function clearPreview() {

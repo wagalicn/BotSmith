@@ -216,3 +216,103 @@ async def test_preview_does_not_leak_env(project, ready_bot):
     )
     assert "MCP_URL" not in os.environ
     assert "LLM_API_KEY" not in os.environ
+
+
+# --------------------------------------------------------------------------
+# 流式预览 preview_chat_stream（SSE 打字机）
+# --------------------------------------------------------------------------
+
+
+async def _collect_preview_stream(**kwargs):
+    """跑 preview_chat_stream，收集成 [(kind, data), ...]"""
+    return [item async for item in service.preview_chat_stream(**kwargs)]
+
+
+async def test_preview_stream_yields_delta_and_done(project, ready_bot):
+    factory, _ = make_factory([("你好呀", [])])
+    items = await _collect_preview_stream(
+        root=project, name="hr-bot", message="你好", engine_factory=factory
+    )
+
+    deltas = [d for k, d in items if k == "delta"]
+    assert "".join(deltas) == "你好呀"
+
+    done = [d for k, d in items if k == "done"]
+    assert len(done) == 1
+    assert done[0]["history"][-2] == {"role": "user", "content": "你好"}
+    assert done[0]["history"][-1] == {"role": "assistant", "content": "你好呀"}
+
+
+async def test_preview_stream_emits_tool_events(project, ready_bot):
+    factory, _ = make_factory(
+        [
+            (None, [tool_call("get_system_config", {})]),
+            ("查到了", []),
+        ]
+    )
+    items = await _collect_preview_stream(
+        root=project, name="hr-bot", message="有哪些系统",
+        identity="L220104", engine_factory=factory,
+    )
+
+    tools = [d for k, d in items if k == "tool"]
+    assert len(tools) == 1
+    assert tools[0]["tool"] == "get_system_config"
+    assert "OA" in tools[0]["result"]
+
+    # 最终文本仍逐段吐出
+    assert "".join(d for k, d in items if k == "delta") == "查到了"
+
+
+async def test_preview_stream_multi_turn_history(project, ready_bot):
+    factory, _ = make_factory([("第二轮回复", [])])
+    prior = [
+        {"role": "user", "content": "第一句"},
+        {"role": "assistant", "content": "第一轮回复"},
+    ]
+    items = await _collect_preview_stream(
+        root=project, name="hr-bot", message="第二句", history=prior,
+        identity="L220104", engine_factory=factory,
+    )
+    done = next(d for k, d in items if k == "done")
+    assert [m["content"] for m in done["history"]] == [
+        "第一句", "第一轮回复", "第二句", "第二轮回复",
+    ]
+
+
+async def test_preview_stream_empty_message_rejected(project, ready_bot):
+    """开流前就能判断的错误：直接抛 UiError（生成器首次推进时）"""
+    with pytest.raises(UiError, match="先输入"):
+        await _collect_preview_stream(root=project, name="hr-bot", message="   ")
+
+
+async def test_preview_stream_unconfigured_rejected(project):
+    service.create_new_bot(project, "fresh")
+    with pytest.raises(UiError, match="配置还没通过校验"):
+        await _collect_preview_stream(root=project, name="fresh", message="你好")
+
+
+async def test_preview_stream_identity_rejected_before_stream(project, ready_bot):
+    """身份不符在开流前抛 UiError，不会半截流式"""
+    factory, _ = make_factory([("不该被调到", [])])
+    with pytest.raises(UiError, match="identity.pattern"):
+        await _collect_preview_stream(
+            root=project, name="hr-bot", message="你好",
+            identity="不合法的身份", engine_factory=factory,
+        )
+
+
+async def test_preview_stream_llm_error_becomes_error_event(project, ready_bot):
+    """进 LLM 后才发生的错误走 error 事件（此时已开流，不能再抛）"""
+    from botkit.llm.base import LlmError
+
+    factory, _ = make_factory([LlmError("模拟 502")])
+    items = await _collect_preview_stream(
+        root=project, name="hr-bot", message="你好",
+        identity="L220104", engine_factory=factory,
+    )
+    kinds = [k for k, _ in items]
+    assert "error" in kinds
+    # 出错时不把这一轮写进历史
+    done = next(d for k, d in items if k == "done")
+    assert done["history"] == []

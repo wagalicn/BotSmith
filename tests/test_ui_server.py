@@ -488,3 +488,75 @@ async def test_unexpected_error_becomes_500_json(project, monkeypatch):
 async def test_unknown_route_404(client):
     resp = await client.get("/api/nope")
     assert resp.status == 404
+
+
+# --------------------------------------------------------------------------
+# 预览 SSE 流式路由 /api/bots/{name}/preview/stream
+# --------------------------------------------------------------------------
+
+
+def _parse_sse(text: str):
+    import json
+
+    events = []
+    for block in text.strip().split("\n\n"):
+        if not block.strip():
+            continue
+        event = None
+        data = None
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data = json.loads(line[len("data:"):].strip())
+        events.append((event, data))
+    return events
+
+
+async def test_preview_stream_route_emits_sse(project, monkeypatch):
+    import botkit.ui.server as server_module
+
+    async def fake_stream(root, name, message, history=None, identity=None):
+        yield "delta", "你"
+        yield "delta", "好"
+        yield "tool", {"tool": "t", "args": {}, "result": "r", "truncated": False}
+        yield "done", {"identity_used": "L220104", "history": []}
+
+    monkeypatch.setattr(server_module.service, "preview_chat_stream", fake_stream)
+
+    async with TestClient(TestServer(create_app(project))) as c:
+        resp = await c.post(
+            "/api/bots/hr-bot/preview/stream",
+            json={"message": "hi"},
+            headers={"Accept": "text/event-stream"},
+        )
+        assert resp.status == 200
+        assert "text/event-stream" in resp.headers["Content-Type"]
+        events = _parse_sse(await resp.text())
+
+    deltas = [d["delta"] for ev, d in events if ev is None and "delta" in d]
+    assert "".join(deltas) == "你好"
+    assert any(ev == "tool" for ev, _ in events)
+    assert any(ev == "done" for ev, _ in events)
+
+
+async def test_preview_stream_route_precheck_error_is_json(project, monkeypatch):
+    """开流前的 UiError 应返回普通 JSON 4xx（而不是半截 SSE）"""
+    import botkit.ui.server as server_module
+    from botkit.ui.service import UiError
+
+    async def fake_stream(root, name, message, history=None, identity=None):
+        raise UiError("配置还没通过校验")
+        yield  # 让它成为 async generator
+
+    monkeypatch.setattr(server_module.service, "preview_chat_stream", fake_stream)
+
+    async with TestClient(TestServer(create_app(project))) as c:
+        resp = await c.post(
+            "/api/bots/hr-bot/preview/stream",
+            json={"message": "hi"},
+            headers={"Accept": "text/event-stream"},
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "配置还没通过校验" in body["error"]
