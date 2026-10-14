@@ -1360,6 +1360,164 @@ async def preview_chat(
     }
 
 
+async def preview_chat_stream(
+    root: Path | str,
+    name: str,
+    message: str,
+    history: list[dict[str, str]] | None = None,
+    identity: str | None = None,
+    engine_factory: Any = None,
+) -> Any:
+    """
+    preview_chat 的流式版本（SSE 打字机）。异步生成器，逐个 yield 事件：
+
+        ("delta", "文本片段")                         最终回复的增量
+        ("tool",  {tool,args,result,truncated})       一次工具调用（trace）
+        ("done",  {identity_used, history})           收尾，带更新后的历史
+        ("error", "给用户看的文案")                    进 LLM 后才发生的错误
+
+    能提前判断的错误（配置没过校验、身份不符）在**开流前**直接抛 UiError，
+    由调用方返回普通 JSON（前端照常弹窗）；只有进了 LLM/MCP 之后才可能发生的
+    连接类错误走 ("error", ...) 事件。
+
+    行为和 preview_chat 对齐：同一套引擎、同样预置历史、同样真调 LLM/MCP。
+    engine_factory 只在测试里传。
+    """
+    from botkit.runtime import (
+        KIND_ERROR,
+        KIND_IDENTITY_INVALID,
+        KIND_LLM,
+        MessagePipeline,
+    )
+    from botkit.session import SessionStore
+
+    message = (message or "").strip()
+    if not message:
+        raise UiError(_m("先输入一句话再发送", "Type a line before sending"))
+
+    bot_dir = bot_dir_for(root, name)
+
+    with isolated_env():
+        try:
+            cfg = load_bot_config(bot_dir)
+        except ConfigError as e:
+            raise UiError(_m(
+                "配置还没通过校验，没法预览。先把下面的问题解决：\n\n" + str(e),
+                "Config hasn't passed validation, can't preview. Fix the problems below first:\n\n" + str(e),
+            )) from e
+
+        used_identity = identity or _sample_identity(cfg)
+
+        # 身份不符 pattern 的话，开流前就拦住（和 preview_chat 的提示一致），
+        # 这样前端能收到普通 JSON 错误而不是半截 SSE。
+        from botkit.engine import identity_matches
+
+        if not identity_matches(used_identity, cfg.identity.pattern):
+            raise UiError(_m(
+                f"预览用的身份 {used_identity!r} 不符合 identity.pattern。"
+                "去「身份与安全」页调整校验规则，或改用别的身份预览。",
+                f"The preview identity {used_identity!r} doesn't match identity.pattern. "
+                "Adjust the validation rule on the \"Identity & Security\" tab, or preview with a different identity.",
+            ))
+
+        build = engine_factory or _build_preview_engine
+        engine = build(cfg)
+
+        sessions = SessionStore.from_config(cfg.session)
+        pipeline = MessagePipeline(
+            cfg, engine, sessions, hooks=getattr(engine, "hooks", None)
+        )
+
+        frame = {
+            "body": {
+                "from": {"userid": used_identity},
+                "chattype": "single",
+                "text": {"content": message},
+            }
+        }
+        session_key = sessions.key_for(frame)
+
+        prior = list(history or [])
+        for j in range(0, len(prior) - 1, 2):
+            u = prior[j]
+            a = prior[j + 1]
+            if u.get("role") == "user" and a.get("role") == "assistant":
+                sessions.append_turn(
+                    session_key, u.get("content", ""), a.get("content", "")
+                )
+
+        trace: list[dict[str, Any]] = []
+
+        async def on_tool_call(tool_name: str, args: dict[str, Any], result: str) -> None:
+            trace.append(
+                {
+                    "tool": tool_name,
+                    "args": args,
+                    "result": result[:2000],
+                    "truncated": len(result) > 2000,
+                }
+            )
+
+        parts: list[str] = []
+        pending_tools = 0  # trace 里已 yield 到哪
+        errored = False
+        try:
+            async for kind, piece in pipeline.handle_stream(
+                frame, on_tool_call=on_tool_call
+            ):
+                # 工具调用是在进 LLM 的过程中发生的，trace 有新项就先吐出去
+                while pending_tools < len(trace):
+                    yield "tool", trace[pending_tools]
+                    pending_tools += 1
+
+                if kind == KIND_LLM:
+                    if piece:
+                        parts.append(piece)
+                        yield "delta", piece
+                elif kind == KIND_ERROR:
+                    errored = True
+                    yield "error", _m(
+                        "进入大模型 / 工具阶段时出错（预览需要真的连上 LLM 和 MCP）。"
+                        "请查看Agent日志确认是密钥、地址还是网络问题。",
+                        "An error occurred entering the LLM / tool stage (preview needs to really connect to the LLM and MCP). "
+                        "Check the Agent logs to see if it's a key, address, or network issue.",
+                    )
+                elif kind == KIND_IDENTITY_INVALID:
+                    errored = True
+                    yield "error", _m(
+                        f"预览用的身份 {used_identity!r} 不符合 identity.pattern。"
+                        "去「身份与安全」页调整校验规则，或改用别的身份预览。",
+                        f"The preview identity {used_identity!r} doesn't match identity.pattern. "
+                        "Adjust the validation rule on the \"Identity & Security\" tab, or preview with a different identity.",
+                    )
+                else:
+                    # 其它前置拦截（空消息/重置/intercept/hook）：直接当文本吐
+                    if piece:
+                        parts.append(piece)
+                        yield "delta", piece
+            # 收尾再把剩余 trace 吐完（通常已吐完）
+            while pending_tools < len(trace):
+                yield "tool", trace[pending_tools]
+                pending_tools += 1
+        except Exception as e:
+            logger.exception("流式预览 %s 时出错", name)
+            errored = True
+            yield "error", _m(
+                f"预览时出错（{type(e).__name__}）：{e}",
+                f"Error during preview ({type(e).__name__}): {e}",
+            )
+        finally:
+            await engine.aclose()
+
+    reply = "".join(parts)
+    new_history = list(history or [])
+    if not errored:
+        new_history.append({"role": "user", "content": message})
+        new_history.append({"role": "assistant", "content": reply})
+
+    yield "done", {"identity_used": used_identity, "history": new_history}
+
+
 # --------------------------------------------------------------------------
 # 探测
 # --------------------------------------------------------------------------

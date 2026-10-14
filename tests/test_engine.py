@@ -29,7 +29,7 @@ from botkit.config import (
 )
 from botkit.engine import BotEngine, IdentityRejected, identity_matches
 from botkit.hooks import HookContext, Hooks
-from botkit.llm.base import LlmError, normalize_response
+from botkit.llm.base import LlmError, StreamChunk, normalize_response
 from botkit.mcp_client import McpToolClient
 from test_mcp_client import make_oa_server
 
@@ -62,6 +62,22 @@ class ScriptedBackend:
             raise step
         content, tool_calls = step
         return normalize_response(content, tool_calls)
+
+    async def stream(self, messages, tools):
+        """用同一套脚本驱动流式：content 逐字吐 delta，末尾吐 done。"""
+        self.calls.append(([dict(m) for m in messages], tools))
+        if not self._script:
+            raise AssertionError("假后端脚本用完了，说明引擎多调了一次 LLM")
+        step = self._script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        content, tool_calls = step
+        resp = normalize_response(content, tool_calls)
+        # 只有纯文本回复才逐字吐（工具调用轮通常无文本增量）
+        if not resp.wants_tools and content:
+            for ch in content:
+                yield StreamChunk(delta=ch)
+        yield StreamChunk(done=True, response=resp)
 
     async def aclose(self):
         self.closed = True
@@ -756,3 +772,96 @@ async def test_aclose_closes_backend():
     engine, _ = make_engine(backend)
     await engine.aclose()
     assert backend.closed
+
+
+# --------------------------------------------------------------------------
+# chat_stream 流式（SSE 用）：行为要和 chat 一致，只是逐段吐文本
+# --------------------------------------------------------------------------
+
+
+async def _collect_stream(engine, *args, **kwargs) -> list[str]:
+    return [tok async for tok in engine.chat_stream(*args, **kwargs)]
+
+
+async def test_chat_stream_yields_text_tokens():
+    backend = ScriptedBackend([("你好呀", [])])
+    engine, _ = make_engine(backend)
+    tokens = await _collect_stream(engine, "hi", identity="L220104")
+    # 逐字吐出，拼起来是完整回复
+    assert "".join(tokens) == "你好呀"
+    assert len(tokens) == 3
+
+
+async def test_chat_stream_rejects_invalid_identity():
+    backend = ScriptedBackend([("不该被调用", [])])
+    engine, _ = make_engine(backend)
+    with pytest.raises(IdentityRejected):
+        await _collect_stream(engine, "hi", identity="坏工号")
+
+
+async def test_chat_stream_runs_tool_call_then_streams_final():
+    backend = ScriptedBackend(
+        [
+            ("", [tool_call("get_system_config", {})]),  # 第1轮：调工具
+            ("配置是 X", []),  # 第2轮：流式最终答复
+        ]
+    )
+    engine, _ = make_engine(backend)
+    tokens = await _collect_stream(engine, "查配置", identity="L220104")
+    assert "".join(tokens) == "配置是 X"
+    # 两轮都走了（工具轮 + 文本轮）
+    assert backend.call_count == 2
+
+
+async def test_chat_stream_identity_injected_into_tool_args():
+    backend = ScriptedBackend(
+        [
+            (None, [tool_call("create_it_ticket", {"title": "修电脑"})]),
+            ("工单已建", []),
+        ]
+    )
+    engine, _ = make_engine(backend)
+    await _collect_stream(engine, "报修", identity="L220104")
+    # 和 chat 一样：work_code 被可信身份注入（真实工具会回显提交人）
+    tool_msg = backend.calls[1][0][-1]
+    assert "提交人=L220104" in tool_msg["content"]
+
+
+async def test_chat_stream_max_rounds_yields_configured_message():
+    msgs = MessagesConfig(tool_rounds_exceeded="轮次太多了")
+    backend = ScriptedBackend(
+        [("", [tool_call("get_system_config", {})]) for _ in range(10)]
+    )
+    engine, _ = make_engine(backend, config=make_config(messages=msgs, max_tool_rounds=3))
+    tokens = await _collect_stream(engine, "转圈", identity="L220104")
+    assert "".join(tokens) == "轮次太多了"
+
+
+async def test_chat_stream_empty_reply_raises():
+    backend = ScriptedBackend([("   ", [])])
+    engine, _ = make_engine(backend)
+    with pytest.raises(LlmError):
+        await _collect_stream(engine, "hi", identity="L220104")
+
+
+async def test_chat_stream_llm_error_propagates():
+    backend = ScriptedBackend([LlmError("模拟 502")])
+    engine, _ = make_engine(backend)
+    with pytest.raises(LlmError, match="502"):
+        await _collect_stream(engine, "hi", identity="L220104")
+
+
+async def test_chat_stream_progress_callback_on_tool_round():
+    backend = ScriptedBackend(
+        [
+            ("", [tool_call("get_system_config", {})]),
+            ("好了", []),
+        ]
+    )
+    engine, _ = make_engine(backend)
+    progress = ProgressRecorder()
+    await _collect_stream(
+        engine, "查", identity="L220104", on_progress=progress
+    )
+    # 工具轮推了进度（和 chat 一致）
+    assert len(progress.labels) >= 1

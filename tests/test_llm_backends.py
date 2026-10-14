@@ -459,3 +459,285 @@ def test_parse_payload_skips_non_dict_tool_call_entries():
         }
     )
     assert [tc.name for tc in resp.tool_calls] == ["t"]
+
+
+# --------------------------------------------------------------------------
+# 流式聚合器 StreamAccumulator
+# --------------------------------------------------------------------------
+
+
+def test_stream_accumulator_text_only():
+    from botkit.llm.base import StreamAccumulator
+
+    acc = StreamAccumulator()
+    assert acc.add_text("你") == "你"
+    acc.add_text("好")
+    acc.add_text("")  # 空增量忽略
+    acc.add_text(None)
+    assert acc.text == "你好"
+
+    resp = acc.finish()
+    assert resp.content == "你好"
+    assert not resp.wants_tools
+    assert resp.message == {"role": "assistant", "content": "你好"}
+
+
+def test_stream_accumulator_tool_calls_merged_by_index():
+    from botkit.llm.base import StreamAccumulator
+
+    acc = StreamAccumulator()
+    # 一个工具的 arguments 分多片到达
+    acc.add_tool_call_delta(0, call_id="c1", name="create_it_ticket")
+    acc.add_tool_call_delta(0, arguments='{"title"')
+    acc.add_tool_call_delta(0, arguments=':"修电脑"}')
+    # 第二个工具
+    acc.add_tool_call_delta(1, call_id="c2", name="get_system_config", arguments="{}")
+
+    resp = acc.finish()
+    assert resp.wants_tools
+    assert [tc.name for tc in resp.tool_calls] == [
+        "create_it_ticket",
+        "get_system_config",
+    ]
+    assert resp.tool_calls[0].arguments == {"title": "修电脑"}
+    assert resp.tool_calls[0].id == "c1"
+
+
+def test_stream_accumulator_empty_finish():
+    from botkit.llm.base import StreamAccumulator
+
+    resp = StreamAccumulator().finish()
+    assert resp.content is None
+    assert not resp.wants_tools
+
+
+# --------------------------------------------------------------------------
+# openai 后端流式
+# --------------------------------------------------------------------------
+
+
+class FakeDelta:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class FakeStreamChoice:
+    def __init__(self, delta):
+        self.delta = delta
+
+
+class FakeStreamChunk:
+    def __init__(self, delta):
+        self.choices = [FakeStreamChoice(delta)]
+
+
+class FakeToolCallDelta:
+    def __init__(self, index, id=None, name=None, arguments=None):
+        self.index = index
+        self.id = id
+        self.function = FakeFunction(name, arguments) if (name or arguments) else None
+
+
+class FakeStream:
+    """模拟 openai SDK stream=True 时返回的异步可迭代对象"""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __aiter__(self):
+        self._it = iter(self._chunks)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+async def _collect(aiter):
+    return [c async for c in aiter]
+
+
+async def test_openai_stream_text_tokens():
+    backend = make_openai_backend(
+        FakeStream(
+            [
+                FakeStreamChunk(FakeDelta(content="你")),
+                FakeStreamChunk(FakeDelta(content="好")),
+                FakeStreamChunk(FakeDelta(content="呀")),
+            ]
+        )
+    )
+    chunks = await _collect(backend.stream([{"role": "user", "content": "hi"}], []))
+
+    deltas = [c.delta for c in chunks if not c.done]
+    assert deltas == ["你", "好", "呀"]
+
+    done = chunks[-1]
+    assert done.done is True
+    assert done.response.content == "你好呀"
+    assert not done.response.wants_tools
+    # stream=True 要真的传给 SDK
+    assert backend._client.chat.completions.kwargs["stream"] is True
+
+
+async def test_openai_stream_tool_calls():
+    backend = make_openai_backend(
+        FakeStream(
+            [
+                FakeStreamChunk(
+                    FakeDelta(
+                        tool_calls=[
+                            FakeToolCallDelta(0, id="c1", name="get_system_config")
+                        ]
+                    )
+                ),
+                FakeStreamChunk(
+                    FakeDelta(tool_calls=[FakeToolCallDelta(0, arguments="{}")])
+                ),
+            ]
+        )
+    )
+    chunks = await _collect(backend.stream([], []))
+
+    # 工具调用轮通常没有文本增量
+    assert [c.delta for c in chunks if not c.done] == []
+    done = chunks[-1]
+    assert done.done is True
+    assert done.response.wants_tools
+    assert done.response.tool_calls[0].name == "get_system_config"
+
+
+async def test_openai_stream_wraps_error():
+    backend = make_openai_backend(OpenAIError("连不上"))
+    with pytest.raises(LlmError, match="连不上"):
+        await _collect(backend.stream([], []))
+
+
+# --------------------------------------------------------------------------
+# aiohttp 后端流式
+# --------------------------------------------------------------------------
+
+
+class FakeStreamContent:
+    """模拟 aiohttp resp.content：按行异步产出 bytes"""
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    def __aiter__(self):
+        self._it = iter(self._lines)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+class FakeStreamResponse:
+    def __init__(self, lines, status=200, text=""):
+        self.status = status
+        self.content = FakeStreamContent(lines)
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _sse(obj: dict) -> bytes:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n".encode("utf-8")
+
+
+async def test_aiohttp_stream_text_tokens():
+    lines = [
+        _sse({"choices": [{"delta": {"content": "你"}}]}),
+        _sse({"choices": [{"delta": {"content": "好"}}]}),
+        b"data: [DONE]\n",
+    ]
+    backend = make_aiohttp_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([{"role": "user", "content": "hi"}], []))
+
+    assert [c.delta for c in chunks if not c.done] == ["你", "好"]
+    done = chunks[-1]
+    assert done.done is True
+    assert done.response.content == "你好"
+    # stream=True 要真的写进请求体
+    assert backend._session.post_calls[0]["json"]["stream"] is True
+
+
+async def test_aiohttp_stream_tool_calls():
+    lines = [
+        _sse(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "c1",
+                                    "function": {
+                                        "name": "create_it_ticket",
+                                        "arguments": '{"title"',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        _sse(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": ':"修"}'}}
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        b"data: [DONE]\n",
+    ]
+    backend = make_aiohttp_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([], []))
+
+    done = chunks[-1]
+    assert done.response.wants_tools
+    assert done.response.tool_calls[0].name == "create_it_ticket"
+    assert done.response.tool_calls[0].arguments == {"title": "修"}
+
+
+async def test_aiohttp_stream_skips_bad_lines():
+    """坏分片、空行、非 data 行都跳过，不炸"""
+    lines = [
+        b"\n",
+        b": keep-alive comment\n",
+        b"data: {not json}\n",
+        _sse({"choices": [{"delta": {"content": "好"}}]}),
+        b"data: [DONE]\n",
+    ]
+    backend = make_aiohttp_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([], []))
+    assert [c.delta for c in chunks if not c.done] == ["好"]
+
+
+async def test_aiohttp_stream_http_error():
+    backend = make_aiohttp_backend(
+        FakeStreamResponse([], status=500, text="boom")
+    )
+    with pytest.raises(LlmError, match="500"):
+        await _collect(backend.stream([], []))

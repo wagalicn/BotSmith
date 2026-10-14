@@ -221,6 +221,81 @@ async def api_preview(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+def _sse_event(data: Any, event: str | None = None) -> bytes:
+    """拼一条 SSE 帧，data 用 JSON 编码（避免文本里的换行破坏协议）。"""
+    import json
+
+    prefix = f"event: {event}\n" if event else ""
+    return (prefix + f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode("utf-8")
+
+
+async def api_preview_stream(request: web.Request) -> web.StreamResponse:
+    """
+    预览对话的 SSE 流式版（打字机）。事件：
+      data: {"delta": "..."}                     文本增量
+      event: tool  / data: {tool,args,result,...} 一次工具调用
+      event: done  / data: {identity_used,history} 收尾
+      event: error / data: {message}              进 LLM 后的错误
+
+    开流前的错误（配置没过校验、身份不符）仍以普通 JSON（4xx）返回，
+    由 error_middleware 处理——所以这里先取生成器的第一个事件触发前置校验，
+    拿到第一个事件后再 prepare 响应、开始写流。
+    """
+    name = request.match_info["name"]
+    payload = await _json_body(request)
+    history = payload.get("history")
+    if history is not None and not isinstance(history, list):
+        raise UiError(_m("history 应该是消息列表", "history should be a message list"))
+
+    agen = service.preview_chat_stream(
+        _root(request),
+        name,
+        str(payload.get("message", "")),
+        history=history,
+        identity=(payload.get("identity") or None),
+    )
+
+    # 先触发前置校验：开流前的 UiError 在这里抛出，交给 error_middleware 转 JSON，
+    # 此时还没 prepare，可以正常返回 4xx。
+    try:
+        first = await agen.__anext__()
+    except StopAsyncIteration:
+        first = None
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await resp.prepare(request)
+
+    async def write_event(item: tuple[str, Any]) -> None:
+        kind, data = item
+        if kind == "delta":
+            await resp.write(_sse_event({"delta": data}))
+        elif kind == "tool":
+            await resp.write(_sse_event(data, event="tool"))
+        elif kind == "error":
+            await resp.write(_sse_event({"message": data}, event="error"))
+        elif kind == "done":
+            await resp.write(_sse_event(data, event="done"))
+
+    try:
+        if first is not None:
+            await write_event(first)
+        async for item in agen:
+            await write_event(item)
+    except Exception:
+        logger.exception("预览 SSE 写流时出错 name=%s", name)
+        await resp.write(_sse_event({"message": "服务端处理出错"}, event="error"))
+
+    await resp.write_eof()
+    return resp
+
+
 async def _json_body(request: web.Request) -> dict[str, Any]:
     try:
         payload = await request.json()
@@ -293,6 +368,7 @@ def create_app(project_root: Path | str = ".") -> web.Application:
     app.router.add_post("/api/bots/{name}/probe/mcp", api_probe_mcp)
     app.router.add_post("/api/bots/{name}/probe/wecom", api_probe_wecom)
     app.router.add_post("/api/bots/{name}/preview", api_preview)
+    app.router.add_post("/api/bots/{name}/preview/stream", api_preview_stream)
     app.router.add_post("/api/prompt/check", api_check_prompt)
     app.router.add_get("/api/skills", api_list_skills)
     app.router.add_post("/api/skills", api_upload_skill)

@@ -28,6 +28,7 @@ pipeline)，往这个 app 上挂它特有的路由（比如某个 bot 的结构�
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -147,6 +148,10 @@ async def _handle_chat(request: web.Request) -> web.Response:
         pipeline: MessagePipeline = request.app[PIPELINE]
         frame = _frame_from_request(message, user, session_id)
 
+        # 流式：调用方带 Accept: text/event-stream 时走 SSE 逐段推送
+        if _wants_sse(request):
+            return await _stream_chat(request, pipeline, frame, session_id)
+
         try:
             reply = await pipeline.handle(frame)
         except Exception:
@@ -161,6 +166,66 @@ async def _handle_chat(request: web.Request) -> web.Response:
         )
     finally:
         reset_message_lang(token)
+
+
+def _wants_sse(request: web.Request) -> bool:
+    """调用方是否要 SSE 流式（Accept 里带 text/event-stream）"""
+    return "text/event-stream" in request.headers.get("Accept", "")
+
+
+def _sse_event(data: dict[str, Any], event: str | None = None) -> bytes:
+    """拼一条 SSE 帧。data 用 JSON 编码，避免 token 里的换行破坏协议。"""
+    prefix = f"event: {event}\n" if event else ""
+    return (prefix + f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode("utf-8")
+
+
+async def _stream_chat(
+    request: web.Request,
+    pipeline: MessagePipeline,
+    frame: dict[str, Any],
+    session_id: str,
+) -> web.StreamResponse:
+    """
+    用 SSE 把回复逐段推给调用方。事件约定：
+    - 文本增量：`data: {"delta": "..."}`
+    - 进度提示：`event: progress` + `data: {"text": "..."}`
+    - 结束：    `event: done` + `data: {"kind": "...", "session_id": "..."}`
+
+    一旦开始 streaming，HTTP 状态码已是 200，中途出错只能用 error 事件告知，
+    没法再改状态码——这是 SSE 的固有特性。
+    """
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 关掉 Nginx 缓冲，token 才能实时到
+        },
+    )
+    await resp.prepare(request)
+
+    async def on_progress(label: str) -> None:
+        try:
+            await resp.write(_sse_event({"text": label}, event="progress"))
+        except Exception:
+            logger.debug("推送 SSE 进度失败（忽略）", exc_info=True)
+
+    last_kind = "llm"
+    try:
+        async for kind, piece in pipeline.handle_stream(frame, on_progress=on_progress):
+            last_kind = kind
+            await resp.write(_sse_event({"delta": piece}))
+    except Exception:
+        logger.exception("SSE 流式处理出错")
+        await resp.write(_sse_event({"message": "服务端处理出错"}, event="error"))
+        await resp.write_eof()
+        return resp
+
+    await resp.write(
+        _sse_event({"kind": last_kind, "session_id": session_id}, event="done")
+    )
+    await resp.write_eof()
+    return resp
 
 
 async def _handle_health(request: web.Request) -> web.Response:

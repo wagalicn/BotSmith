@@ -51,17 +51,25 @@
 `/{agent}/chat` / `GET /agents`。防返工前置（`SessionStore` 接口化、`base_path`）此前已就位。
 **待续**：SSE 流式（见下）；门户页；RedisSessionStore（去掉会话亲和、随意扩缩）。
 
-### 2. 流式回复（SSE）  —— 未做（接入点已就位）
+### 2. 流式回复（SSE）  —— ✅ 已完成（2026-10）
 **为什么**：聊天窗要「打字机」效果，等一整段返回体验差。
-**做成什么**：`POST /chat` 支持 `Accept: text/event-stream`，逐段推 token。
-**复用**：`pipeline.handle` 已有 `on_progress` 回调，可作为流式推送的接入点；
-或在 engine 的 function calling 循环里加增量回调。
-**现状（2026-10）**：
-- ✅ `pipeline.handle(frame, on_progress=..., on_tool_call=...)` 已有回调，engine 循环已透传
-  `on_progress`（企微那边已用它推进度消息）。
-- ⬜ `api_server.py` 的 `/chat` 仍是一次性 `web.json_response`，没有 SSE 分支；
-  真正的「逐 token 增量」还需要 LLM 后端支持流式输出（当前 `backend.complete` 是整段返回），
-  这块要先确认两个后端能不能流式，再决定是走 token 级还是「进度+整段」级 SSE。
+**做成什么**（已实现，全部新增、不改现有契约）：
+- `POST /chat`（单 Agent 与 `/{agent}/chat` 网关都支持）带 `Accept: text/event-stream`
+  走 SSE：文本增量 `data:{delta}`、进度 `event:progress`、结束 `event:done{kind,session_id}`、
+  异常 `event:error`。不带该头则维持原来的整段 JSON，行为不变。
+- 鉴权/参数校验（401/400）在开流前完成；工具调用轮不逐字推，只有最终答复走打字机。
+**落地位置**：
+- LLM 后端：`llm/base.py` 新增 `StreamChunk` + `StreamAccumulator`，`LlmBackend` 加 `stream()`；
+  `openai_backend`（SDK `stream=True`）、`aiohttp_backend`（裸 HTTP 读 SSE 行）各实现一份；
+  `complete()` 保持不变。
+- 引擎：`engine.chat_stream()` 逐 token yield（抽出 `_execute_tool_calls` 与 `chat` 共用）；
+  `chat()` 签名/返回不变。
+- 流程：`runtime.MessagePipeline.handle_stream()` 复用 `_prepare()` 前置逻辑，逐段 yield
+  `(kind, text)`；`api_server._handle_chat` 加 `_wants_sse` 分支 + `_stream_chat`。
+- 测试：`test_llm_backends`（流式）、`test_engine`（chat_stream）、`test_runtime`（handle_stream）、
+  新建 `test_sse.py`（HTTP 层端到端）。
+**说明**：采用「乐观流式」——每轮都可流式，工具轮通常无文本增量，done 片段的
+`response.wants_tools` 决定是否继续工具轮。文档见 `docs/配置参考.md`「流式回复（SSE）」。
 
 ### 3. bot 注册表 + 聚合门户页（「ITbot 大全」）  —— 未做
 **为什么**：给同事一个入口，列出所有 bot，点进去就能聊。
