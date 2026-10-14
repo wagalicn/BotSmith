@@ -29,6 +29,7 @@ pipeline)，往这个 app 上挂它特有的路由（比如某个 bot 的结构�
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from aiohttp import web
@@ -193,5 +194,102 @@ def create_api_app(
     if hooks is not None and hooks.has_routes:
         logger.info("加载 bot 自定义路由（register_routes），前缀=%r", base_path)
         hooks.register_routes(app, config, pipeline, base_path=base_path)
+
+    return app
+
+
+# --------------------------------------------------------------------------
+# 多 Agent 网关：一个进程、一个端口挂多个 Agent
+#
+# 命名空间 /{agent}/...：每个 Agent 用 create_api_app 建一个子 app（裸路径
+# /chat、/health、以及它自己 register_routes 挂的端点），再用 aiohttp 的
+# add_subapp 统一加 /{agent} 前缀。对外表现为 /{agent}/chat 等。
+#
+# 关键：子 app 用 base_path=""（裸路径），前缀完全交给 add_subapp，避免和
+# base_path 机制叠加导致前缀重复。每个子 app 自带独立的 CONFIG/PIPELINE，
+# _handle_chat 取到的就是对应 Agent 的 config/pipeline —— per-Agent 的
+# pipeline/engine/SessionStore 隔离与按各自 api.token 鉴权，天然成立。
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class GatewayAgent:
+    """
+    网关里的一个 Agent 条目。
+
+    pipeline 非 None 表示可挂载；为 None（通常连带 error）表示配置加载失败，
+    不挂它的路由，但仍在 GET /agents 里标为不可用。
+    """
+
+    name: str
+    config: BotConfig | None = None
+    pipeline: MessagePipeline | None = None
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.pipeline is not None and self.config is not None
+
+
+AGENTS = web.AppKey("agents", list)
+
+
+async def _handle_agents(request: web.Request) -> web.Response:
+    """
+    GET /agents：列出网关里所有 Agent 及在线状态（名字、是否可用、错误原因）。
+
+    免鉴权——这是给门户列卡片用的发现接口，不涉及对话内容或密钥。
+    """
+    agents: list[GatewayAgent] = request.app[AGENTS]
+    return web.json_response(
+        {
+            "agents": [
+                {
+                    "name": a.name,
+                    "ok": a.ok,
+                    "path": f"/{a.name}/chat",
+                    "error": a.error,
+                }
+                for a in agents
+            ]
+        }
+    )
+
+
+async def _handle_gateway_health(request: web.Request) -> web.Response:
+    """网关整体探活，免鉴权。available 是能对话的 Agent 数。"""
+    agents: list[GatewayAgent] = request.app[AGENTS]
+    return web.json_response(
+        {
+            "ok": True,
+            "agents": len(agents),
+            "available": sum(1 for a in agents if a.ok),
+        }
+    )
+
+
+def build_gateway_app(agents: list[GatewayAgent]) -> web.Application:
+    """
+    组装多 Agent 网关的父 app（纯函数，不起端口，方便用 TestClient 测）。
+
+    - 每个可用 Agent（pipeline 非 None）用 create_api_app 建子 app（base_path=""，
+      裸路径），add_subapp(f"/{name}") 挂到 /{name} 命名空间下；
+    - 不可用的 Agent 不挂路由，只在 GET /agents 里报告；
+    - 父 app 提供 GET /agents 和 GET /health（都免鉴权）。
+    """
+    app = web.Application()
+    app[AGENTS] = agents
+    app.router.add_get("/agents", _handle_agents)
+    app.router.add_get("/health", _handle_gateway_health)
+
+    for a in agents:
+        if not a.ok:
+            logger.warning("Agent %s 不可用，不挂载：%s", a.name, a.error)
+            continue
+        assert a.config is not None and a.pipeline is not None  # ok 已保证
+        hooks = getattr(a.pipeline, "hooks", None)
+        sub = create_api_app(a.config, a.pipeline, hooks=hooks, base_path="")
+        app.add_subapp(f"/{a.name}", sub)
+        logger.info("网关已挂载 Agent：/%s/chat", a.name)
 
     return app

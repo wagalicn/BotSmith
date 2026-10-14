@@ -78,8 +78,26 @@ def resolve_api_port(cli_port: int | None, env: dict[str, str], config_port: int
 
 def _cmd_serve_api(args: argparse.Namespace) -> int:
     import os
+    from pathlib import Path
 
-    from botkit.runtime import serve_chat_api
+    from botkit.runtime import serve_api_gateway, serve_chat_api
+
+    # 分流：目录里直接有 bot.yaml → 单 Agent（现状不变）；
+    # 否则当作「包含多个 Agent 的父目录」→ 多 Agent 网关。
+    if not (Path(args.bot_dir) / "bot.yaml").is_file():
+        try:
+            # 网关默认端口 9000，仍走统一的 --port / BOTKIT_API_PORT 优先级
+            port = resolve_api_port(args.port, dict(os.environ), 9000)
+        except ValueError as e:
+            print(f"端口无效：{e}", file=sys.stderr)
+            return 1
+        try:
+            serve_api_gateway(args.bot_dir, port=port)
+        except ConfigError as e:
+            print("启动网关失败：\n", file=sys.stderr)
+            print(str(e), file=sys.stderr)
+            return 1
+        return 0
 
     try:
         cfg = load_bot_config(args.bot_dir)
@@ -90,7 +108,7 @@ def _cmd_serve_api(args: argparse.Namespace) -> int:
 
     if not cfg.api.enabled:
         print(
-            "这个 bot 没开对外接口。请在配置页「对外接口」把它打开，"
+            "这个 Agent 没开对外接口。请在配置页「对外接口」把它打开，"
             "或在 bot.yaml 里设 api.enabled: true 再启动。",
             file=sys.stderr,
         )
@@ -197,7 +215,13 @@ def build_parser() -> argparse.ArgumentParser:
         "serve-api",
         help="只启动对外 chat 接口（不连企微，用于对接 Dify / 门户）",
     )
-    p_api.add_argument("bot_dir", help="Agent 目录（里面有 bot.yaml）")
+    p_api.add_argument(
+        "bot_dir",
+        help=(
+            "单个 Agent 目录（里面有 bot.yaml）起单 Agent 接口；"
+            "或 bots/ 父目录起多 Agent 网关（/{agent}/chat）"
+        ),
+    )
     p_api.add_argument(
         "--port",
         type=int,
