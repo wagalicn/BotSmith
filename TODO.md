@@ -28,21 +28,28 @@
 
 ## 待做（按优先级）
 
-### 1. 一进程挂多个 bot（多 bot API 网关）  —— 未做（地基已就位）
-**为什么**：门户后面会有一堆 bot，一个 bot 一个进程/端口不好管。
-**做成什么**：
-- `python -m botkit serve-api bots/`（指向整个 bots 目录，扫描所有开了 `api.enabled` 的 bot）。
-- 路由改成 `POST /chat/<botname>`，一个端口服务多个 bot。
-- `GET /bots` 返回可用 bot 列表（名字、简介、是否在线）。
-**注意**：各 bot 的 SessionStore、引擎要隔离；一个 bot 配置坏了不能拖垮整个网关。
-**现状（2026-10）**：
-- ✅ 防返工前置已完成：`SessionStore` 已是接口（`session.py`，内存实现 + 预留 Redis）；
-  `register_routes` / `create_api_app` 已支持 `base_path`（`hooks.py` / `api_server.py`）。
-- ⬜ 还没做的实际网关部分：
-  - `cli.py` 的 `serve-api` 只接单个 `bot_dir`；`runtime.serve_chat_api(config)` 单 bot。
-  - `create_api_app(config, pipeline, ...)` 只挂一个 bot 的裸 `POST /chat`，还不是 `/chat/<botname>`。
-  - 没有 `GET /bots` 列表端点；没有「扫描 bots/ 目录、为每个在线 bot 各建一套 pipeline/engine/store」的组装层。
-  - `build_pipeline(config)` 是单 bot 组装，网关需要一个「{botname: pipeline}」的多实例管理。
+### 1. 一进程挂多个 Agent（多 Agent API 网关）  —— ✅ 已完成（2026-10）
+**为什么**：门户后面会有一堆 Agent，一个 Agent 一个进程/端口不好管。
+**做成什么**（已实现，路由形态以门户架构决策 §Q2 为准，走 `/{agent}/` 命名空间）：
+- `python -m botkit serve-api bots/`：指向整个 bots 父目录，扫描所有开了
+  `api.enabled` 的 Agent，一个进程、一个端口全挂起来。单 Agent 启动方式
+  （`serve-api bots/<名>`）完全保留，网关是叠加能力。
+- 路由：`POST /{agent}/chat`、`GET /{agent}/health`；网关级 `GET /agents`
+  （列表 + 在线状态 + 错误原因）、`GET /health`（整体探活）。
+- 鉴权按各 Agent 自己的 `api.token`；每个 Agent 独立 pipeline/engine/SessionStore；
+  某个 Agent 配置坏了只标为不可用、不拖垮网关。
+- 端口沿用 `--port > BOTKIT_API_PORT > 默认 9000`；网关进程可多开（多端口）
+  交给 Nginx 做负载均衡，与单 Agent 多端口混用。
+**落地位置**：
+- `config.discover_api_bots` / `DiscoveredBot`（扫描 + 逐个加载，坏的不中断）。
+- `api_server.build_gateway_app` / `GatewayAgent` / `_handle_agents` / 网关 `GET /health`
+  （每个 Agent 用 `create_api_app(base_path="")` 建子 app + `add_subapp("/{agent}")`）。
+- `runtime.build_gateway_from_dir` / `serve_api_gateway`（组装 + 起统一端口）。
+- `cli.serve-api` 按路径分流：含 `bot.yaml`=单 Agent（现状不变），否则父目录=网关。
+- 测试：`tests/test_discover.py`、`tests/test_gateway.py`、`tests/test_cli.py`（分流）。
+**说明**：早期设想的 `POST /chat/<botname>` / `GET /bots` 命名已按门户架构决策统一为
+`/{agent}/chat` / `GET /agents`。防返工前置（`SessionStore` 接口化、`base_path`）此前已就位。
+**待续**：SSE 流式（见下）；门户页；RedisSessionStore（去掉会话亲和、随意扩缩）。
 
 ### 2. 流式回复（SSE）  —— 未做（接入点已就位）
 **为什么**：聊天窗要「打字机」效果，等一整段返回体验差。

@@ -15,9 +15,10 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from botkit.config import BotConfig
+from botkit.config import BotConfig, DiscoveredBot, discover_api_bots
 from botkit.engine import BotEngine, IdentityRejected, identity_matches
 from botkit.hooks import HookContext, Hooks, load_hooks
 from botkit.llm import create_backend
@@ -297,6 +298,45 @@ async def _start_chat_api(
     return runner
 
 
+def build_gateway_from_dir(
+    bots_dir: str | Path, *, load_env: bool = True
+) -> tuple[Any, list[BotEngine]]:
+    """
+    扫描 bots/ 目录，为每个开了对外接口的 Agent 建独立 pipeline，组装成一个
+    多 Agent 网关父 app。返回 (gateway_app, engines)。
+
+    engines 是所有成功挂载的 Agent 的引擎列表，调用方收尾时逐个 aclose。
+    单个 Agent 建 pipeline 失败不中断，标为不可用（GET /agents 里报告）。
+    """
+    from botkit.api_server import GatewayAgent, build_gateway_app
+
+    discovered: list[DiscoveredBot] = discover_api_bots(bots_dir, load_env=load_env)
+
+    agents: list[GatewayAgent] = []
+    engines: list[BotEngine] = []
+    for d in discovered:
+        if d.config is None:
+            agents.append(GatewayAgent(name=d.name, error=d.error))
+            continue
+        try:
+            pipeline, engine = build_pipeline(d.config)
+        except Exception as e:
+            logger.exception("为 Agent %s 组装 pipeline 失败", d.name)
+            agents.append(
+                GatewayAgent(
+                    name=d.name,
+                    config=d.config,
+                    error=f"组装失败（{type(e).__name__}）：{e}",
+                )
+            )
+            continue
+        agents.append(GatewayAgent(name=d.name, config=d.config, pipeline=pipeline))
+        engines.append(engine)
+
+    app = build_gateway_app(agents)
+    return app, engines
+
+
 def serve_chat_api(config: BotConfig, port: int | None = None) -> None:
     """
     只起 chat HTTP 接口，不连企微。用于纯 API 部署（对接 Dify/门户）。
@@ -330,6 +370,62 @@ def serve_chat_api(config: BotConfig, port: int | None = None) -> None:
         except Exception:
             logger.debug("关闭 LLM 后端时出错（忽略）", exc_info=True)
         logger.info("chat 接口服务 %s 已停止", config.name)
+
+
+def serve_api_gateway(bots_dir: str | Path, port: int = 9000) -> None:
+    """
+    多 Agent 网关：一个进程、一个端口挂 bots/ 目录下所有开了对外接口的 Agent。
+
+    路由命名空间 /{agent}/chat、/{agent}/health，外加网关级 GET /agents、
+    GET /health。每个 Agent 独立 pipeline/engine/SessionStore，按各自 api.token
+    鉴权；某个 Agent 配置坏了只标为不可用，不拖垮整个网关。
+
+    改某个 Agent 的 bot.yaml 需重启整个网关才生效（提示词/技能文件仍是热加载）。
+    """
+    setup_logging("gateway", "INFO")
+
+    app, engines = build_gateway_from_dir(bots_dir)
+
+    # 从 app 里把 Agent 清单捞出来打日志（build_gateway_app 存进了 AGENTS）
+    from botkit.api_server import AGENTS
+
+    agents = app[AGENTS]
+    available = [a.name for a in agents if a.ok]
+    broken = [(a.name, a.error) for a in agents if not a.ok]
+
+    logger.info("正在启动多 Agent 网关：%s", bots_dir)
+    logger.info("可用 Agent（%d）：%s", len(available), "、".join(available) or "(无)")
+    for name, err in broken:
+        logger.warning("不可用 Agent：%s —— %s", name, err)
+
+    if not available:
+        logger.error("没有任何可用的 Agent（都没开 api.enabled 或都加载失败），网关不启动")
+        return
+
+    async def main() -> None:
+        from aiohttp import web
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+        logger.info("网关已启动：http://0.0.0.0:%d/{agent}/chat（GET /agents 看清单）", port)
+        try:
+            await asyncio.Event().wait()  # 挂住直到取消
+        finally:
+            await runner.cleanup()
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在退出")
+    finally:
+        for engine in engines:
+            try:
+                asyncio.run(engine.aclose())
+            except Exception:
+                logger.debug("关闭某个 Agent 的 LLM 后端时出错（忽略）", exc_info=True)
+        logger.info("多 Agent 网关已停止")
 
 
 def run_bot(config: BotConfig) -> None:

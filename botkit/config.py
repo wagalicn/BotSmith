@@ -1051,6 +1051,90 @@ def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
 
 
 # --------------------------------------------------------------------------
+# 多 Agent 发现（门户网关用）
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class DiscoveredBot:
+    """
+    网关扫描一个 bots/ 目录时，对其中每个 Agent 的发现结果。
+
+    config 为 None 表示这个 Agent 加载失败（error 里有原因），网关不把它挂上去，
+    但会在 GET /agents 里标为不可用——一个 Agent 配置坏了不该拖垮整个网关。
+    """
+
+    name: str
+    config: BotConfig | None = None
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.config is not None
+
+
+def discover_api_bots(
+    bots_dir: str | Path, *, load_env: bool = True
+) -> list[DiscoveredBot]:
+    """
+    扫描一个 bots/ 父目录，找出所有「开了对外接口（api.enabled）」的 Agent，
+    供门户网关一次挂多个 Agent 用。
+
+    规则：
+    - 只看直接子目录里含 bot.yaml 的，按名字排序；
+    - 跳过以 . 或 _ 开头的目录（.trash 回收站、_skills 共享技能目录等）；
+    - 逐个 load_bot_config，单个失败只记录 error、不中断，保证坏一个不拖垮整体；
+    - 只有加载成功且 api.enabled=true 的才算「可挂载」（config 非 None）；
+      加载失败的也返回（config=None + error），让 GET /agents 能标为不可用；
+    - 加载成功但没开 api.enabled 的，直接忽略（不进结果，它本就不该对外）。
+
+    返回按 Agent 名字排序的 DiscoveredBot 列表。
+    """
+    parent = Path(bots_dir).expanduser()
+    if not parent.is_absolute():
+        parent = (Path.cwd() / parent).resolve()
+    else:
+        parent = parent.resolve()
+
+    if not parent.is_dir():
+        raise ConfigError(_m(
+            f"bots 目录不存在：{parent}",
+            f"bots directory not found: {parent}",
+        ))
+
+    result: list[DiscoveredBot] = []
+    for child in sorted(parent.iterdir()):
+        if child.name.startswith((".", "_")):
+            continue
+        if not child.is_dir() or not (child / "bot.yaml").is_file():
+            continue
+
+        try:
+            cfg = load_bot_config(child, load_env=load_env)
+        except ConfigError as e:
+            result.append(DiscoveredBot(name=child.name, error=str(e)))
+            continue
+        except Exception as e:  # 配置以外的意外错误也不能拖垮扫描
+            logger.exception("加载 Agent %s 时出现意外错误", child.name)
+            result.append(
+                DiscoveredBot(
+                    name=child.name,
+                    error=f"意外错误（{type(e).__name__}）：{e}",
+                )
+            )
+            continue
+
+        if not cfg.api.enabled:
+            # 没开对外接口的 Agent 不纳入网关（它本就不该暴露 /chat）
+            logger.debug("Agent %s 未开启 api.enabled，网关跳过", child.name)
+            continue
+
+        result.append(DiscoveredBot(name=child.name, config=cfg))
+
+    return result
+
+
+# --------------------------------------------------------------------------
 # 运行中热加载提示词 / 技能文件
 # --------------------------------------------------------------------------
 

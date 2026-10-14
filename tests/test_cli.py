@@ -434,3 +434,75 @@ def test_bots_dir_ships_empty_but_present():
     bots = Path(__file__).resolve().parent.parent / "bots"
     assert bots.is_dir()
     assert (bots / ".gitkeep").is_file(), "缺少 .gitkeep，空目录会在复制/git 时丢掉"
+
+
+# --------------------------------------------------------------------------
+# serve-api 分流：单 Agent 目录 vs 多 Agent 父目录
+# --------------------------------------------------------------------------
+
+
+def test_serve_api_single_agent_dispatch(tmp_path, monkeypatch, base_env):
+    """bot_dir 里直接有 bot.yaml（且开了 api）→ 走单 Agent serve_chat_api"""
+    import botkit.runtime as runtime
+    from conftest import MINIMAL_YAML
+
+    bot_dir = tmp_path / "solo"
+    bot_dir.mkdir()
+    (bot_dir / "bot.yaml").write_text(
+        MINIMAL_YAML + "\napi:\n  enabled: true\n", encoding="utf-8"
+    )
+    (bot_dir / "prompt.md").write_text("你是测试。", encoding="utf-8")
+
+    calls = {}
+    monkeypatch.setattr(
+        runtime, "serve_chat_api",
+        lambda cfg, port=None: calls.setdefault("single", (cfg.name, port)),
+    )
+    monkeypatch.setattr(
+        runtime, "serve_api_gateway",
+        lambda d, port=9000: calls.setdefault("gateway", (d, port)),
+    )
+
+    assert main(["serve-api", str(bot_dir)]) == 0
+    assert "single" in calls and "gateway" not in calls
+    assert calls["single"][0] == "test-bot"
+
+
+def test_serve_api_gateway_dispatch(tmp_path, monkeypatch):
+    """bot_dir 里没有 bot.yaml → 当作父目录，走多 Agent 网关"""
+    import botkit.runtime as runtime
+
+    parent = tmp_path / "bots"
+    parent.mkdir()  # 空父目录，没有 bot.yaml
+
+    calls = {}
+    monkeypatch.setattr(
+        runtime, "serve_chat_api",
+        lambda cfg, port=None: calls.setdefault("single", True),
+    )
+    monkeypatch.setattr(
+        runtime, "serve_api_gateway",
+        lambda d, port=9000: calls.setdefault("gateway", (str(d), port)),
+    )
+
+    assert main(["serve-api", str(parent)]) == 0
+    assert "gateway" in calls and "single" not in calls
+    assert calls["gateway"][1] == 9000  # 网关默认端口
+
+
+def test_serve_api_gateway_port_override(tmp_path, monkeypatch):
+    """网关模式也遵守 --port 覆盖"""
+    import botkit.runtime as runtime
+
+    parent = tmp_path / "bots"
+    parent.mkdir()
+
+    captured = {}
+    monkeypatch.setattr(
+        runtime, "serve_api_gateway",
+        lambda d, port=9000: captured.setdefault("port", port),
+    )
+    monkeypatch.setattr(runtime, "serve_chat_api", lambda cfg, port=None: None)
+
+    assert main(["serve-api", str(parent), "--port", "9500"]) == 0
+    assert captured["port"] == 9500
