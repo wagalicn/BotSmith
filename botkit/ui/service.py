@@ -431,12 +431,20 @@ def _sole_placeholder_var(value: Any) -> str | None:
     return match.group(1) if match else None
 
 
-# LLM 在「大模型」页明文维护的三个字段 -> .env 里的固定变量名
+# LLM 在「大模型」页明文维护的字段 -> .env 里的固定变量名
 LLM_ENV_FIELDS = {
     "api_url": "LLM_API_URL",
     "api_key": "LLM_API_KEY",
     "model": "LLM_MODEL",
+    # 代理地址可能带 user:pass，同样按密钥方式维护（页面填明文、值落 .env）
+    "http_proxy": "LLM_HTTP_PROXY",
 }
+
+# 开关型的可选字段：llm 段里**有没有这个键**就代表启不启用。
+# 页面上用勾选框控制——不勾选时前端会把键删掉，这里就不写占位符、也不碰 .env，
+# 于是生成的 bot.yaml 里压根没有这行（没用代理的配置保持干净）。
+# 其余字段（密钥、地址、模型名）是必填项，留空时保留 .env 旧值以免误清。
+LLM_OPTIONAL_FIELDS = {"http_proxy"}
 
 
 def _resolve_llm_plain(raw: dict[str, Any], env_values: dict[str, str]) -> set[str]:
@@ -456,6 +464,10 @@ def _resolve_llm_plain(raw: dict[str, Any], env_values: dict[str, str]) -> set[s
         # 只有当占位符正好是约定的固定变量时才接管，避免误伤自定义占位符
         if cur_var == var:
             llm[field_name] = env_values.get(var, "")
+            hidden.add(var)
+        elif field_name in LLM_OPTIONAL_FIELDS:
+            # 可选字段没启用时，它的固定变量仍归「大模型」页管（.env 里可能还留着
+            # 上次填的值）。一并隐藏，别让它跑到「密钥」页去让人以为要填。
             hidden.add(var)
     return hidden
 
@@ -702,8 +714,8 @@ def _extract_server_headers(
 
 def _extract_llm_env(bot_dir: Path, values: dict[str, Any]) -> dict[str, str]:
     """
-    把 llm 段 api_url/api_key/model 的明文落到 .env 固定变量，
-    并把 llm 段这三个字段就地改回 ${LLM_XXX} 占位符（供 dump_bot_yaml）。
+    把 llm 段 LLM_ENV_FIELDS 里各字段（api_url/api_key/model/http_proxy）的明文
+    落到 .env 固定变量，并把这些字段就地改回 ${LLM_XXX} 占位符（供 dump_bot_yaml）。
 
     返回要写进 .env 的 {变量名: 明文值}。
     - 填了明文 → 写回 .env、yaml 存占位符。
@@ -715,6 +727,9 @@ def _extract_llm_env(bot_dir: Path, values: dict[str, Any]) -> dict[str, str]:
     existing = read_env_file(bot_dir / ".env")
     updates: dict[str, str] = {}
     for field_name, var in LLM_ENV_FIELDS.items():
+        # 开关型可选字段：键不在就是没启用，什么都不写（yaml 里也不会有这行）
+        if field_name in LLM_OPTIONAL_FIELDS and field_name not in llm:
+            continue
         raw_val = llm.get(field_name)
         # 已经是占位符就别动（比如前端没改、或用户手写了别的占位符）
         cur_var = _sole_placeholder_var(raw_val)
@@ -1766,6 +1781,11 @@ def form_options() -> dict[str, Any]:
                 "value": "aiohttp",
                 "label": "aiohttp（兼容模式）",
                 "note": "裸 HTTP，用于不规范的兼容端点。地址填完整端点",
+            },
+            {
+                "value": "anthropic",
+                "label": "anthropic（Claude 原生协议）",
+                "note": "给只提供 Messages API 的端点用，典型是 Bedrock 上的 Claude。地址填到 /v1 为止",
             },
         ],
         "session_scopes": [

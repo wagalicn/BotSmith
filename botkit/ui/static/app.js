@@ -296,6 +296,7 @@ const ENV_HINT_KEYS = {
   LLM_API_URL: "env.LLM_API_URL",
   LLM_API_KEY: "env.LLM_API_KEY",
   LLM_MODEL: "env.LLM_MODEL",
+  LLM_HTTP_PROXY: "env.LLM_HTTP_PROXY",
   // MCP 地址不在这里 —— 它在「工具」页每个服务端旁边填
 };
 
@@ -348,8 +349,57 @@ function renderLlm() {
       type: "number",
       narrow: true,
       note: t("llm.rounds_note"),
+    }),
+    textField({
+      path: "llm.max_tokens",
+      label: t("llm.max_tokens_label"),
+      type: "number",
+      narrow: true,
+      placeholder: "8192",
+      note: t("llm.max_tokens_note"),
     })
   );
+
+  // HTTP 代理（可选）：勾选才启用。不勾选时 llm 段里不保留 http_proxy 这个键，
+  // 生成的 bot.yaml 里也就没有这行 —— 没用代理的配置保持干净。
+  const llmSection = state.values.llm || {};
+  const proxyOn = Object.prototype.hasOwnProperty.call(llmSection, "http_proxy");
+  const proxyToggle = el("input", {
+    type: "checkbox",
+    id: "llm-proxy-enabled",
+    checked: proxyOn,
+    onchange: (e) => {
+      const llm = state.values.llm || (state.values.llm = {});
+      if (e.target.checked) {
+        if (!llm.http_proxy) llm.http_proxy = "";
+      } else {
+        delete llm.http_proxy;
+      }
+      markDirty();
+      render();
+    },
+  });
+  box.append(
+    el("div", { class: "row" }, [
+      proxyToggle,
+      el(
+        "label",
+        { for: "llm-proxy-enabled", style: "font-weight:600;margin:0" },
+        [el("span", { text: t("llm.proxy_enable") })]
+      ),
+    ]),
+    el("p", { class: "desc", text: t("llm.proxy_enable_desc") })
+  );
+  if (proxyOn) {
+    box.append(
+      textField({
+        path: "llm.http_proxy",
+        label: t("llm.proxy_label"),
+        placeholder: "http://127.0.0.1:7890",
+        note: t("llm.proxy_note"),
+      })
+    );
+  }
 
   // 显示/隐藏 api_key 明文（复用全局 showSecrets）
   box.append(
@@ -368,6 +418,8 @@ function renderLlm() {
 
   if (client === "aiohttp") {
     box.prepend(note("warn", t("llm.aiohttp_warn")));
+  } else if (client === "anthropic") {
+    box.prepend(note("warn", t("llm.anthropic_warn")));
   }
 }
 

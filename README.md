@@ -46,7 +46,7 @@ python -m botkit run bots/hr-assistant         # 连企微；若开了对外接�
 | 看什么 | 去哪 |
 |---|---|
 | **第一次建 Agent** | [新建 Agent 步骤说明书](docs/新建Bot步骤说明书.md) —— 10 步，主线用配置页面，每步带预期结果和卡住了怎么办 |
-| **查某个字段怎么配** | [配置参考](docs/配置参考.md) —— `bot.yaml` 全字段、hook、双后端、处理流程 |
+| **查某个字段怎么配** | [配置参考](docs/配置参考.md) —— `bot.yaml` 全字段、hook、三个后端、处理流程 |
 | 这个项目是怎么回事 | 本文件 |
 
 ---
@@ -105,8 +105,12 @@ GET  http://<服务器IP>:<port>/health         # 探活，免鉴权
 - **异常兜底**：工具失败、模型编造工具名、LLM 挂掉都不会让 Agent 装死
 - **报错可定位**：anyio TaskGroup 的异常组会拆开打，不再是一句
   `unhandled errors in a TaskGroup`
-- **两个 LLM 后端**：默认 openai 官方 SDK；遇到不规范的兼容端点切
-  `aiohttp` 裸 HTTP，能拿到原始响应排查
+- **三个 LLM 后端**：默认 openai 官方 SDK；遇到不规范的兼容端点切 `aiohttp`
+  裸 HTTP，能拿到原始响应排查；只提供 Claude 原生 Messages 协议的端点
+  （如 Amazon Bedrock 上的 Claude）用 `anthropic`。切后端只改一行配置，
+  工具调用和流式对上层行为一致
+- **访问受限端点**：`llm.http_proxy` 让访问 LLM 的请求经代理转发，
+  用于端点有地区/网络限制的场景（两个协议都支持）
 - **对外 chat 接口**：一条 `POST /chat` 把 Agent 暴露给 Dify / 内部门户 / 任何第三方
 - **自定义 HTTP 端点**：某个 Agent 需要 `/chat` 之外的专属端点时，通过 `register_routes`
   扩展点挂上，不改骨架。**这项需要写 Python 代码**（区别于纯配置就能改的对话/工具/文案），
@@ -166,7 +170,7 @@ bot-demo/
 │   ├── config.py             # 配置加载与校验
 │   ├── yaml_writer.py        # 生成带注释的 bot.yaml（页面存盘用）
 │   ├── engine.py             # function calling 循环、身份注入
-│   ├── llm/                  # 两个 LLM 后端
+│   ├── llm/                  # 三个 LLM 后端（openai / aiohttp / anthropic）
 │   ├── mcp_client.py         # MCP 连接、工具过滤、连接复用
 │   ├── session.py            # 多轮上下文
 │   ├── hooks.py              # 扩展点加载

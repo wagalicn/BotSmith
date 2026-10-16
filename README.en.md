@@ -46,7 +46,7 @@ and files edited by hand still open fine in the page.
 | What you want | Where to go |
 |---|---|
 | **Building an Agent for the first time** | [Guide: Creating a New Agent](docs/creating-a-new-agent.md) —— 10 steps, mainly via the config page, each with expected results and troubleshooting |
-| **How to configure a specific field** | [Configuration Reference](docs/configuration-reference.md) —— all `bot.yaml` fields, hooks, dual backends, processing pipeline |
+| **How to configure a specific field** | [Configuration Reference](docs/configuration-reference.md) —— all `bot.yaml` fields, hooks, the three backends, processing pipeline |
 | What this project is about | This file |
 
 ---
@@ -105,8 +105,12 @@ Built in, so you don't have to worry about it:
 - **Failure fallbacks**: tool failures, fabricated tool names, or a dead LLM won't make the Agent freeze up
 - **Locatable errors**: anyio TaskGroup exception groups are unpacked and logged individually, no more a single
   `unhandled errors in a TaskGroup`
-- **Two LLM backends**: defaults to the official openai SDK; for non-standard compatible endpoints, switch to
-  `aiohttp` raw HTTP to get the raw response for debugging
+- **Three LLM backends**: defaults to the official openai SDK; for non-standard compatible endpoints, switch to
+  `aiohttp` raw HTTP to get the raw response for debugging; for endpoints that only speak Claude's native
+  Messages protocol (e.g. Claude on Amazon Bedrock) use `anthropic`. Switching is a one-line config change,
+  and tool calling plus streaming behave the same to upper layers
+- **Restricted endpoints**: `llm.http_proxy` routes LLM requests through a proxy, for endpoints with
+  regional or network restrictions (supported on both protocols)
 - **External chat API**: a single `POST /chat` exposes the Agent to Dify / an internal portal / any third party
 - **Custom HTTP endpoints**: when an Agent needs a dedicated endpoint beyond `/chat`, attach it via the `register_routes`
   extension point without changing the skeleton. **This one requires Python code** (unlike the dialog/tools/copy that are pure config),
@@ -166,7 +170,7 @@ bot-demo/
 │   ├── config.py             # config loading and validation
 │   ├── yaml_writer.py        # generate commented bot.yaml (used when saving from the page)
 │   ├── engine.py             # function-calling loop, identity injection
-│   ├── llm/                  # the two LLM backends
+│   ├── llm/                  # the three LLM backends (openai / aiohttp / anthropic)
 │   ├── mcp_client.py         # MCP connections, tool filtering, connection reuse
 │   ├── session.py            # multi-turn context
 │   ├── hooks.py              # extension point loading

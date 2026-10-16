@@ -39,12 +39,14 @@ When something is misconfigured, `python -m botkit validate <bot dir>` points ou
 | `api.enabled` | no | `false` | Enable the external chat API (POST /chat) |
 | `api.port` | no | `9000` | Port the chat API listens on |
 | `api.token` | no | — | Chat API auth token, blank = no auth |
-| `llm.client` | no | `openai` | LLM backend, `openai` or `aiohttp` |
+| `llm.client` | no | `openai` | LLM backend, `openai` / `aiohttp` / `anthropic` |
 | `llm.api_url` | yes | — | LLM endpoint, written differently per backend |
 | `llm.api_key` | yes | — | LLM key |
 | `llm.model` | yes | — | Model name |
 | `llm.timeout_seconds` | no | `60` | Per-request timeout |
 | `llm.max_tool_rounds` | no | `6` | Max tool rounds the model may run per turn |
+| `llm.max_tokens` | no | — | Max tokens generated per reply, blank = no limit |
+| `llm.http_proxy` | no | — | Route LLM requests through an HTTP proxy, blank = direct |
 | `prompt.file` | one of | — | Path to the prompt file |
 | `prompt.inline` | one of | — | Write the prompt inline |
 | `mcp.servers[].name` | yes | — | Server identifier, your choice |
@@ -271,19 +273,23 @@ llm:
   model: ${LLM_MODEL}
   timeout_seconds: 60
   max_tool_rounds: 6
+  # Both optional; omit the whole line when not needed
+  max_tokens: 8192
+  http_proxy: ${LLM_HTTP_PROXY}
 ```
 
-### client: how to choose between the two backends
+### client: how to choose between the three backends
 
-The two backends produce identical results; switching is a one-line change.
+All three backends produce identical results; switching is a one-line change. The first two speak the
+**OpenAI Chat Completions** protocol, the third speaks the **Anthropic Messages** protocol.
 
-| | `openai` (default) | `aiohttp` |
-|---|---|---|
-| Implementation | official openai SDK | raw HTTP POST |
-| Auto-retry | yes | no |
-| `api_url` form | up to `/v1` | full endpoint, including `/chat/completions` |
-| On a non-standard response | pydantic validation throws, you can't see the raw response | you get the raw JSON and handle it yourself, errors include a snippet of the body |
-| Fits | the vast majority of cases | non-standard self-built endpoints or gateways |
+| | `openai` (default) | `aiohttp` | `anthropic` |
+|---|---|---|---|
+| Protocol | OpenAI Chat Completions | OpenAI Chat Completions | Anthropic Messages |
+| Implementation | official openai SDK | raw HTTP POST | raw HTTP POST |
+| Auto-retry | yes | no | no |
+| `api_url` form | up to `/v1` | full endpoint, including `/chat/completions` | up to `/v1` |
+| Fits | the vast majority of cases | non-standard self-built endpoints or gateways | endpoints that only offer the Messages API |
 
 **Start with `openai`.** If startup produces a pydantic validation error, or you can't tell from the logs what
 the LLM actually returned, switch to `aiohttp` and look again —— it prints the raw response,
@@ -292,6 +298,48 @@ which usually pinpoints where the other side is non-standard.
 Typical cases `aiohttp` can absorb: responses stuffed with custom fields, a deviated `tool_calls`
 structure, errors returned with HTTP 200 (error info in the `error` field),
 and a `choices[0].message` missing fields.
+
+#### When you need `anthropic`
+
+What matters is the **protocol**, not whose model it is. As long as the endpoint offers an OpenAI-compatible
+interface, Claude works fine on the `openai` backend too. But some endpoints only expose Claude's native
+Messages API, and that's when you need `anthropic`:
+
+| How you reach Claude | Backend |
+|---|---|
+| Anthropic's official OpenAI-compatible endpoint | `openai` |
+| Claude behind a third-party gateway (OneAPI, etc.) | `openai` |
+| **Claude on Amazon Bedrock** | **`anthropic`** |
+| Anthropic's official native API | `anthropic` |
+
+Typical symptom: sending `/chat/completions` to Claude on Bedrock returns
+`The model '...' does not support the '/v1/chat/completions' API` —— that's the signal to switch to `anthropic`.
+
+```yaml
+# Claude on Bedrock
+llm:
+  client: anthropic
+  api_url: ${LLM_API_URL}   # https://bedrock-mantle.us-east-1.api.aws/anthropic/v1
+  api_key: ${LLM_API_KEY}   # Bedrock API key
+  model: ${LLM_MODEL}       # e.g. anthropic.claude-sonnet-5
+
+# Anthropic's official API
+llm:
+  client: anthropic
+  api_url: ${LLM_API_URL}   # https://api.anthropic.com/v1
+  api_key: ${LLM_API_KEY}
+  model: ${LLM_MODEL}       # e.g. claude-sonnet-5
+```
+
+- `api_url` goes up to `/v1`; the backend appends `/messages` itself (if you end it with `/messages`,
+  `validate` catches it and tells you how to fix it).
+- The auth header is **picked automatically**, no extra switch needed: Bedrock (`*.amazonaws.com` /
+  `*.api.aws`) gets `Authorization: Bearer`, everything else (Anthropic official and compatible gateways)
+  gets `x-api-key`. They **must not both be sent** —— Anthropic returns 401 for requests carrying both.
+- **Model IDs on Bedrock are named differently from the native API**: the native API uses inference
+  profile IDs like `us.anthropic.claude-...-v1:0`, while the Messages endpoint uses
+  `anthropic.claude-sonnet-5`. The models list endpoint (available on mantle) can list the exact IDs.
+- Tool calling and streaming are both adapted; upper-layer behaviour matches the other two backends.
 
 ### api_url
 
@@ -306,6 +354,71 @@ api_url: https://xxx.maas.aliyuncs.com/compatible-mode/v1/chat/completions
 ```
 
 When the `openai` backend is configured with a full endpoint, `validate` catches it and tells you how to fix it.
+
+### max_tokens: the per-reply length cap
+
+**Optional.** Caps how many tokens the model may generate in one reply. Blank = no limit, the endpoint's
+own default applies.
+
+```yaml
+llm:
+  max_tokens: 8192
+```
+
+Why there's no framework-level default: **ceilings vary enormously between models**, so no single value
+works for everyone. Exceeding a model's ceiling fails the request outright, so check what your model
+supports before setting it:
+
+| Model | Output ceiling (reference) |
+|---|---|
+| Claude 3 series (legacy) | 4,096 |
+| Claude 3.5 Sonnet | 8,192 |
+| Claude 3.7 Sonnet | 64,000 (up to 128,000 with extended thinking) |
+| Current Claude models (Opus 5.5 / Sonnet 5.5, etc.) | 128,000 |
+
+> The table is a reference for picking a value; always defer to the model docs of the platform you use.
+
+How each backend handles it:
+
+- **`anthropic`**: the Messages API **requires** it, so the backend sends **8192** when left blank.
+  Configure a larger value for longer output (but stay under the model's ceiling).
+- **`openai` / `aiohttp`**: blank means the parameter **isn't sent at all**, so behaviour is exactly as
+  before; it's only included once you set it.
+
+The 8192 default is plenty for everyday conversation. Raise it when generating long documents,
+large code blocks, or lengthy structured results.
+
+### http_proxy: route LLM requests through a proxy
+
+**Optional.** Some model endpoints have regional or network restrictions (e.g. requests from a restricted
+region fail outright). This routes LLM requests through an HTTP proxy whose egress is in an allowed region.
+
+```yaml
+llm:
+  # ...
+  http_proxy: ${LLM_HTTP_PROXY}
+```
+
+```
+# .env
+LLM_HTTP_PROXY=http://127.0.0.1:7890
+```
+
+- **Supported on all backends**; it only affects requests to the LLM, not MCP tool calls or the WeCom
+  connection.
+- Format `http://host:port`, or `http://user:pass@host:port` when auth is required. Because it may carry
+  a password, the real value goes in `.env` and `bot.yaml` only holds the placeholder.
+- **Omit the whole line when not using a proxy** (or leave the checkbox unticked on the config page).
+  When a proxy is configured, the startup log prints that LLM requests will be routed through it,
+  which is a handy way to confirm it took effect.
+
+On the config page this is a checkbox on the "Model" tab: tick it to reveal the address field; leaving it
+unticked keeps the setting out of `bot.yaml` entirely.
+
+> ⚠️ When hand-editing `bot.yaml`: if you write `http_proxy: ${LLM_HTTP_PROXY}` but `.env` has **no**
+> `LLM_HTTP_PROXY` variable at all, startup fails with "references undefined environment variable".
+> Either keep a blank `LLM_HTTP_PROXY=` line in `.env` (equivalent to no proxy), or remove the line
+> from `bot.yaml`.
 
 ### max_tool_rounds
 

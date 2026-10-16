@@ -568,3 +568,49 @@ def test_config_summary_masks_secrets(bot_dir_factory, base_env):
     assert "sk-t" in summary
     assert "test-bot" in summary
     assert "main" in summary
+
+
+# --------------------------------------------------------------------------
+# llm.max_tokens / llm.client=anthropic
+# --------------------------------------------------------------------------
+
+
+def test_max_tokens_defaults_to_none(bot_dir_factory, base_env):
+    """不配 = 不限制（由端点默认值决定）"""
+    cfg = load_bot_config(bot_dir_factory())
+    assert cfg.llm.max_tokens is None
+
+
+def test_max_tokens_parsed(bot_dir_factory, base_env):
+    yaml_text = MINIMAL_YAML.replace(
+        "  model: test-model", "  model: test-model\n  max_tokens: 2048"
+    )
+    cfg = load_bot_config(bot_dir_factory(yaml_text=yaml_text))
+    assert cfg.llm.max_tokens == 2048
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_max_tokens_rejects_non_positive(bot_dir_factory, base_env, bad):
+    yaml_text = MINIMAL_YAML.replace(
+        "  model: test-model", f"  model: test-model\n  max_tokens: {bad}"
+    )
+    with pytest.raises(ConfigError, match="max_tokens"):
+        load_bot_config(bot_dir_factory(yaml_text=yaml_text))
+
+
+def test_anthropic_client_accepted(bot_dir_factory, base_env):
+    yaml_text = MINIMAL_YAML.replace(
+        "  model: test-model", "  client: anthropic\n  model: test-model"
+    )
+    cfg = load_bot_config(bot_dir_factory(yaml_text=yaml_text))
+    assert cfg.llm.client == "anthropic"
+
+
+def test_anthropic_api_url_with_messages_suffix_rejected(bot_dir_factory, base_env):
+    """anthropic 后端的 api_url 应到 /v1 为止，填成 /messages 要拦下来"""
+    yaml_text = MINIMAL_YAML.replace(
+        "  api_url: https://example.invalid/compatible-mode/v1",
+        "  api_url: https://example.invalid/anthropic/v1/messages",
+    ).replace("  model: test-model", "  client: anthropic\n  model: test-model")
+    with pytest.raises(ConfigError, match="messages"):
+        load_bot_config(bot_dir_factory(yaml_text=yaml_text))
