@@ -173,7 +173,12 @@ def _dump_llm(values: dict[str, Any]) -> list[str]:
         "client 可选 " + " / ".join(VALID_LLM_CLIENTS) + "\n"
         "  openai  官方 SDK，自带重试。api_url 填到 /v1 为止\n"
         "  aiohttp 裸 HTTP，用于不规范的兼容端点。api_url 填完整端点\n"
-        "max_tool_rounds 是一轮对话最多让模型调几轮工具，防止打转",
+        "  anthropic Claude 原生 Messages 协议，给只提供 Messages API 的端点用\n"
+        "          （如 Bedrock 上的 Claude）。api_url 填到 /v1 为止\n"
+        "max_tool_rounds 是一轮对话最多让模型调几轮工具，防止打转\n"
+        "max_tokens 可选：单次回复最多生成多少 token。留空=不限制；\n"
+        "          各模型上限差异很大，anthropic 协议留空时按 8192 发送\n"
+        "http_proxy 可选：端点有地区/网络限制时，让 LLM 请求经代理转发",
     )
     lines.append("llm:")
     lines.extend(_kv("client", client, 2))
@@ -182,6 +187,13 @@ def _dump_llm(values: dict[str, Any]) -> list[str]:
     lines.extend(_kv("model", _get(llm, "model", "${LLM_MODEL}"), 2))
     lines.extend(_kv("timeout_seconds", _get(llm, "timeout_seconds", 60), 2))
     lines.extend(_kv("max_tool_rounds", _get(llm, "max_tool_rounds", 6), 2))
+    # 以下是可选项：没配就不写这行，保持 bot.yaml 干净
+    max_tokens = _get(llm, "max_tokens", "")
+    if max_tokens:
+        lines.extend(_kv("max_tokens", max_tokens, 2))
+    proxy = _get(llm, "http_proxy", "")
+    if proxy:
+        lines.extend(_kv("http_proxy", proxy, 2))
     return lines
 
 

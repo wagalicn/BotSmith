@@ -68,9 +68,11 @@ class AiohttpBackend:
         }
 
         session = await self._get_session()
+        # 配了代理就按请求级 proxy 走转发；没配时传 None 等同不走代理。
+        proxy = self.cfg.http_proxy or None
         try:
             async with session.post(
-                self.cfg.api_url, headers=headers, json=body
+                self.cfg.api_url, headers=headers, json=body, proxy=proxy
             ) as resp:
                 text = await resp.text()
                 if resp.status != 200:
@@ -110,9 +112,11 @@ class AiohttpBackend:
 
         acc = StreamAccumulator()
         session = await self._get_session()
+        # 同 complete：配了代理就带上，没配传 None。
+        proxy = self.cfg.http_proxy or None
         try:
             async with session.post(
-                self.cfg.api_url, headers=headers, json=body
+                self.cfg.api_url, headers=headers, json=body, proxy=proxy
             ) as resp:
                 if resp.status != 200:
                     text = await resp.text()

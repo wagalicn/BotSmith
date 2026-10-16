@@ -61,7 +61,7 @@ def _m(zh: str, en: str) -> str:
 # ${VAR} 占位符
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-VALID_LLM_CLIENTS = ("openai", "aiohttp")
+VALID_LLM_CLIENTS = ("openai", "aiohttp", "anthropic")
 VALID_SESSION_SCOPES = ("group_user", "group", "user")
 VALID_IDENTITY_SOURCES = ("wecom_userid", "hook")
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -118,6 +118,17 @@ class LlmConfig:
     client: str = "openai"
     timeout_seconds: float = 60.0
     max_tool_rounds: int = 6
+    # 单次回复最多生成多少 token。None = 不限制（由端点自己的默认值决定）。
+    #
+    # 各模型上限差异很大（旧 Claude 3 只有 4096，当前 Claude 新模型可到 128000），
+    # 所以这里不设框架级默认值：
+    #   - anthropic 后端：Messages API 要求必填，没配时后端兜底成 8192
+    #   - openai 后端：没配就不传这个参数，行为和以前完全一致
+    max_tokens: int | None = None
+    # 走代理访问 LLM 端点。形如 http://host:port 或 http://user:pass@host:port。
+    # 留空 = 不走代理。用于端点有地区/网络访问限制、需要经指定出口转发的场景。
+    # 两个后端都支持；值可用 ${VAR} 占位存 .env。
+    http_proxy: str | None = None
 
 
 @dataclass
@@ -473,7 +484,16 @@ def _parse_llm(raw: Any) -> LlmConfig:
         ))
     _reject_unknown(
         data,
-        {"client", "api_url", "api_key", "model", "timeout_seconds", "max_tool_rounds"},
+        {
+            "client",
+            "api_url",
+            "api_key",
+            "model",
+            "timeout_seconds",
+            "max_tool_rounds",
+            "max_tokens",
+            "http_proxy",
+        },
         "llm",
     )
     client = _one_of((_opt_str(data, "client", "llm", "openai") or "openai"), VALID_LLM_CLIENTS, "llm.client")
@@ -493,6 +513,30 @@ def _parse_llm(raw: Any) -> LlmConfig:
             "  or set llm.client to aiohttp (the raw HTTP backend accepts a full URL)",
         ))
 
+    # anthropic 后端同理：api_url 到 /v1 为止，后端自己拼 /messages
+    if client == "anthropic" and api_url.rstrip("/").endswith("/messages"):
+        fixed = api_url.rstrip("/")[: -len("/messages")]
+        raise ConfigError(_m(
+            "llm.client=anthropic 时，llm.api_url 应该填到 /v1 为止（不含 /messages），"
+            "后端会自己拼接路径。当前值：" + api_url + "\n"
+            "  改成： " + fixed,
+            "When llm.client=anthropic, llm.api_url should go up to /v1 (without /messages); "
+            "the backend appends the path itself. Current value: " + api_url + "\n"
+            "  change to: " + fixed,
+        ))
+
+    # max_tokens 省略 = 不限制（见 LlmConfig 里的说明）。配了就必须是正整数。
+    max_tokens: int | None = None
+    if data.get("max_tokens") is not None:
+        max_tokens = _opt_int(data, "max_tokens", "llm", 0)
+        if max_tokens < 1:
+            raise ConfigError(_m(
+                f"llm.max_tokens 应该是正整数，当前是 {max_tokens}。"
+                "留空表示不限制（由端点默认值决定）",
+                f"llm.max_tokens should be a positive integer, but is {max_tokens}. "
+                "Leave it empty for no limit (the endpoint's default applies)",
+            ))
+
     return LlmConfig(
         client=client,
         api_url=api_url,
@@ -500,6 +544,8 @@ def _parse_llm(raw: Any) -> LlmConfig:
         model=_require_str(data, "model", "llm"),
         timeout_seconds=_opt_number(data, "timeout_seconds", "llm", 60.0),
         max_tool_rounds=_opt_int(data, "max_tool_rounds", "llm", 6),
+        max_tokens=max_tokens,
+        http_proxy=_opt_str(data, "http_proxy", "llm", None),
     )
 
 

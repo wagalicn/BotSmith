@@ -15,6 +15,7 @@ from typing import Any
 
 from typing import AsyncIterator
 
+import httpx2
 from openai import APIError, AsyncOpenAI, OpenAIError
 
 from botkit.config import LlmConfig
@@ -34,10 +35,19 @@ class OpenAIBackend:
 
     def __init__(self, cfg: LlmConfig):
         self.cfg = cfg
+        # 配了代理就显式给 SDK 传一个走代理的 http client。openai SDK 底层是
+        # httpx2（见 requirements），但不会自动读环境变量里的代理，必须显式传。
+        # 这个 client 由本后端持有，aclose() 时随 SDK 一起兜底关闭。
+        self._http_client: httpx2.AsyncClient | None = None
+        if cfg.http_proxy:
+            self._http_client = httpx2.AsyncClient(proxy=cfg.http_proxy)
+            logger.info("LLM 请求将经代理转发：%s", cfg.http_proxy)
+
         self._client = AsyncOpenAI(
             api_key=cfg.api_key,
             base_url=cfg.api_url,
             timeout=cfg.timeout_seconds,
+            http_client=self._http_client,
         )
 
     async def complete(
@@ -131,3 +141,6 @@ class OpenAIBackend:
 
     async def aclose(self) -> None:
         await self._client.close()
+        # 传给 SDK 的 http_client 由我们创建，SDK 不一定负责关，这里兜底关一次
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()

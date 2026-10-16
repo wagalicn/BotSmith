@@ -69,6 +69,7 @@ const I18N = {
     "env.LLM_API_URL": "用 openai 后端时填到 /v1 为止，不要带 /chat/completions",
     "env.LLM_API_KEY": "大模型平台的密钥",
     "env.LLM_MODEL": "模型名，如 qwen3.7-plus",
+    "env.LLM_HTTP_PROXY": "可选。访问大模型用的 HTTP 代理，不用就留空",
 
     // ---- 大模型 ----
     "llm.h2": "大模型",
@@ -80,6 +81,24 @@ const I18N = {
     "llm.key_note": "大模型平台的密钥。存进本地 .env、不进 git",
     "llm.model_label": "模型（model）",
     "llm.model_note": "模型名，直接填明文。存进本地 .env、不进 git",
+    "llm.max_tokens_label": "单次回复最多生成（token）",
+    "llm.max_tokens_note":
+      "留空 = 不限制，由端点默认值决定。各模型上限差别很大：" +
+      "旧 Claude 3 只有 4096，Claude 3.5 是 8192，当前新模型可到 128000。" +
+      "超过模型上限会直接报错。anthropic 协议必须带这个参数，留空时按 8192 发送",
+    "llm.anthropic_warn":
+      "anthropic 协议（Claude 原生 Messages API）：地址填到 /v1 为止，" +
+      "后端会自己拼 /messages。例如 Bedrock 填 " +
+      "https://bedrock-mantle.<区域>.api.aws/anthropic/v1，" +
+      "直连官方填 https://api.anthropic.com/v1。" +
+      "用它的场景是端点只提供 Messages API（如 Bedrock 上的 Claude）",
+    "llm.proxy_enable": "通过 HTTP 代理访问大模型",
+    "llm.proxy_enable_desc":
+      "端点有地区或网络限制时才需要。不勾选 = 直连，bot.yaml 里不会写这项配置",
+    "llm.proxy_label": "代理地址",
+    "llm.proxy_note":
+      "格式 http://host:port，需要认证就 http://user:pass@host:port。" +
+      "两个后端都支持。值存进本地 .env、不进 git",
     "llm.timeout_label": "单次请求超时（秒）",
     "llm.timeout_note": "带工具调用的一轮对话会请求多次，总耗时可能是它的几倍",
     "llm.rounds_label": "最多连续调几轮工具",
@@ -420,6 +439,7 @@ const I18N = {
     "env.LLM_API_URL": "For the openai backend, go up to /v1, without /chat/completions",
     "env.LLM_API_KEY": "The model platform's key",
     "env.LLM_MODEL": "The model name, e.g. qwen3.7-plus",
+    "env.LLM_HTTP_PROXY": "Optional. HTTP proxy for reaching the model; leave empty if unused",
 
     // ---- model ----
     "llm.h2": "Model",
@@ -431,6 +451,26 @@ const I18N = {
     "llm.key_note": "The model platform's key. Stored in the local .env, not in git",
     "llm.model_label": "Model (model)",
     "llm.model_note": "The model name, fill plaintext directly. Stored in the local .env, not in git",
+    "llm.max_tokens_label": "Max tokens per reply",
+    "llm.max_tokens_note":
+      "Empty = no limit, the endpoint's default applies. Ceilings vary a lot by model: " +
+      "legacy Claude 3 allows 4096, Claude 3.5 allows 8192, current models reach 128000. " +
+      "Exceeding a model's ceiling fails the request. The anthropic protocol requires this " +
+      "parameter, so 8192 is sent when left empty",
+    "llm.anthropic_warn":
+      "anthropic protocol (Claude's native Messages API): set the address up to /v1, " +
+      "the backend appends /messages itself. For Bedrock use " +
+      "https://bedrock-mantle.<region>.api.aws/anthropic/v1, " +
+      "for the official API use https://api.anthropic.com/v1. " +
+      "Use this when the endpoint only offers the Messages API (e.g. Claude on Bedrock)",
+    "llm.proxy_enable": "Reach the model through an HTTP proxy",
+    "llm.proxy_enable_desc":
+      "Only needed when the endpoint has regional or network restrictions. " +
+      "Unchecked = direct connection, and this setting isn't written to bot.yaml",
+    "llm.proxy_label": "Proxy address",
+    "llm.proxy_note":
+      "Format http://host:port, or http://user:pass@host:port if it needs auth. " +
+      "Both backends support it. Stored in the local .env, not in git",
     "llm.timeout_label": "Per-request timeout (seconds)",
     "llm.timeout_note": "A turn with tool calls makes multiple requests, so the total time may be several times this",
     "llm.rounds_label": "Max consecutive tool rounds",

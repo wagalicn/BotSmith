@@ -24,8 +24,18 @@ from botkit.llm.base import (
 from botkit.llm.openai_backend import OpenAIBackend
 
 
-def cfg(client: str = "openai", api_url: str = "http://fake/v1") -> LlmConfig:
-    return LlmConfig(api_url=api_url, api_key="sk-test", model="test-model", client=client)
+def cfg(
+    client: str = "openai",
+    api_url: str = "http://fake/v1",
+    http_proxy: str | None = None,
+) -> LlmConfig:
+    return LlmConfig(
+        api_url=api_url,
+        api_key="sk-test",
+        model="test-model",
+        client=client,
+        http_proxy=http_proxy,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -296,8 +306,10 @@ class FakeAiohttpSession:
         self.closed = False
         self.post_calls = []
 
-    def post(self, url, headers=None, json=None):
-        self.post_calls.append({"url": url, "headers": headers, "json": json})
+    def post(self, url, headers=None, json=None, proxy=None):
+        self.post_calls.append(
+            {"url": url, "headers": headers, "json": json, "proxy": proxy}
+        )
         if isinstance(self._response, Exception):
             raise self._response
         return self._response
@@ -306,9 +318,9 @@ class FakeAiohttpSession:
         self.closed = True
 
 
-def make_aiohttp_backend(response):
+def make_aiohttp_backend(response, http_proxy=None):
     return AiohttpBackend(
-        cfg("aiohttp", "http://fake/v1/chat/completions"),
+        cfg("aiohttp", "http://fake/v1/chat/completions", http_proxy=http_proxy),
         session=FakeAiohttpSession(response),
     )
 
@@ -741,3 +753,518 @@ async def test_aiohttp_stream_http_error():
     )
     with pytest.raises(LlmError, match="500"):
         await _collect(backend.stream([], []))
+
+
+# --------------------------------------------------------------------------
+# llm.http_proxy 代理配置
+# --------------------------------------------------------------------------
+
+
+async def test_openai_backend_no_proxy_by_default():
+    """不配 http_proxy 时不建代理 client（行为与以前一致）"""
+    backend = OpenAIBackend(cfg("openai"))
+    assert backend._http_client is None
+    await backend.aclose()
+
+
+async def test_openai_backend_builds_proxy_client():
+    """配了 http_proxy 时建一个走代理的 http client 传给 SDK"""
+    backend = OpenAIBackend(cfg("openai", http_proxy="http://127.0.0.1:7890"))
+    assert backend._http_client is not None
+    # 收尾要能把自建的 client 关掉，不留未关闭告警
+    await backend.aclose()
+    assert backend._http_client.is_closed
+
+
+async def test_aiohttp_backend_no_proxy_by_default():
+    """不配代理时 post 的 proxy 参数为 None"""
+    backend = make_aiohttp_backend(
+        FakeResponse(payload={"choices": [{"message": {"content": "ok"}}]})
+    )
+    await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert backend._session.post_calls[0]["proxy"] is None
+
+
+async def test_aiohttp_backend_passes_proxy():
+    """配了代理时 post 带上 proxy=代理地址"""
+    backend = make_aiohttp_backend(
+        FakeResponse(payload={"choices": [{"message": {"content": "ok"}}]}),
+        http_proxy="http://127.0.0.1:7890",
+    )
+    await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert backend._session.post_calls[0]["proxy"] == "http://127.0.0.1:7890"
+
+
+async def test_aiohttp_stream_passes_proxy():
+    """流式 stream() 那处 post 也要带上 proxy（容易漏的一处）"""
+    lines = [
+        _sse({"choices": [{"delta": {"content": "好"}}]}),
+        b"data: [DONE]\n",
+    ]
+    backend = make_aiohttp_backend(
+        FakeStreamResponse(lines), http_proxy="http://127.0.0.1:7890"
+    )
+    await _collect(backend.stream([], []))
+    assert backend._session.post_calls[0]["proxy"] == "http://127.0.0.1:7890"
+
+
+# --------------------------------------------------------------------------
+# anthropic 后端（Claude 原生 Messages 协议）
+# --------------------------------------------------------------------------
+
+
+def anthropic_cfg(api_url="http://fake/anthropic/v1", http_proxy=None, max_tokens=None):
+    return LlmConfig(
+        api_url=api_url,
+        api_key="sk-test",
+        model="anthropic.claude-sonnet-5",
+        client="anthropic",
+        http_proxy=http_proxy,
+        max_tokens=max_tokens,
+    )
+
+
+def make_anthropic_backend(response, **kw):
+    from botkit.llm.anthropic_backend import AnthropicBackend
+
+    return AnthropicBackend(
+        anthropic_cfg(**kw), session=FakeAiohttpSession(response)
+    )
+
+
+def _msg_response(blocks, stop_reason="end_turn"):
+    return FakeResponse(payload={"content": blocks, "stop_reason": stop_reason})
+
+
+# -- 后端选择 ---------------------------------------------------------------
+
+
+def test_create_backend_picks_anthropic():
+    from botkit.llm.anthropic_backend import AnthropicBackend
+
+    backend = create_backend(anthropic_cfg())
+    assert isinstance(backend, AnthropicBackend)
+    assert backend.name == "anthropic"
+
+
+# -- 请求转换：messages ------------------------------------------------------
+
+
+def test_convert_messages_lifts_system_to_top_level():
+    from botkit.llm.anthropic_backend import _convert_messages
+
+    system, converted = _convert_messages(
+        [
+            {"role": "system", "content": "你是助手"},
+            {"role": "user", "content": "你好"},
+        ]
+    )
+    assert system == "你是助手"
+    assert converted == [{"role": "user", "content": "你好"}]
+
+
+def test_convert_messages_joins_multiple_system():
+    from botkit.llm.anthropic_backend import _convert_messages
+
+    system, _ = _convert_messages(
+        [
+            {"role": "system", "content": "第一段"},
+            {"role": "system", "content": "第二段"},
+            {"role": "user", "content": "hi"},
+        ]
+    )
+    assert system == "第一段\n\n第二段"
+
+
+def test_convert_messages_assistant_tool_calls_become_tool_use():
+    from botkit.llm.anthropic_backend import _convert_messages
+
+    _, converted = _convert_messages(
+        [
+            {"role": "user", "content": "报修"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "function": {"name": "create_it_ticket", "arguments": '{"a":1}'},
+                    }
+                ],
+            },
+        ]
+    )
+    block = converted[-1]["content"][0]
+    assert converted[-1]["role"] == "assistant"
+    assert block["type"] == "tool_use"
+    assert block["id"] == "c1"
+    assert block["name"] == "create_it_ticket"
+    # arguments 的 JSON 字符串要解析成对象
+    assert block["input"] == {"a": 1}
+
+
+def test_convert_messages_tool_result_becomes_user_block():
+    from botkit.llm.anthropic_backend import _convert_messages
+
+    _, converted = _convert_messages(
+        [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "t", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "工具结果"},
+        ]
+    )
+    last = converted[-1]
+    assert last["role"] == "user"
+    assert last["content"][0] == {
+        "type": "tool_result",
+        "tool_use_id": "c1",
+        "content": "工具结果",
+    }
+
+
+def test_convert_messages_merges_consecutive_tool_results():
+    """
+    一轮调多个工具时会产生多条 role=tool，转换后都是 user。
+    Messages API 要求 user/assistant 交替，必须合并成一条，否则请求被拒。
+    """
+    from botkit.llm.anthropic_backend import _convert_messages
+
+    _, converted = _convert_messages(
+        [
+            {"role": "user", "content": "q"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "t1", "arguments": "{}"}},
+                    {"id": "c2", "function": {"name": "t2", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "结果1"},
+            {"role": "tool", "tool_call_id": "c2", "content": "结果2"},
+        ]
+    )
+    roles = [m["role"] for m in converted]
+    # 角色必须交替，不能出现连续 user
+    assert roles == ["user", "assistant", "user"]
+    # 两个工具结果合并进同一条消息
+    assert len(converted[-1]["content"]) == 2
+    assert [b["tool_use_id"] for b in converted[-1]["content"]] == ["c1", "c2"]
+
+
+def test_convert_messages_keeps_assistant_text_with_tool_calls():
+    """模型边说话边调工具时，文本和 tool_use 都要保留"""
+    from botkit.llm.anthropic_backend import _convert_messages
+
+    _, converted = _convert_messages(
+        [
+            {"role": "user", "content": "q"},
+            {
+                "role": "assistant",
+                "content": "我查一下",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "t", "arguments": "{}"}}
+                ],
+            },
+        ]
+    )
+    types = [b["type"] for b in converted[-1]["content"]]
+    assert types == ["text", "tool_use"]
+
+
+def test_convert_messages_broken_tool_arguments_become_empty():
+    from botkit.llm.anthropic_backend import _convert_messages
+
+    _, converted = _convert_messages(
+        [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "t", "arguments": "{不是 json"}}
+            ]},
+        ]
+    )
+    assert converted[-1]["content"][0]["input"] == {}
+
+
+# -- 请求转换：tools --------------------------------------------------------
+
+
+def test_convert_tools_renames_parameters_to_input_schema():
+    from botkit.llm.anthropic_backend import _convert_tools
+
+    out = _convert_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "t",
+                    "description": "说明",
+                    "parameters": {"type": "object", "properties": {"a": {}}},
+                },
+            }
+        ]
+    )
+    assert out == [
+        {
+            "name": "t",
+            "description": "说明",
+            "input_schema": {"type": "object", "properties": {"a": {}}},
+        }
+    ]
+
+
+def test_convert_tools_skips_malformed():
+    from botkit.llm.anthropic_backend import _convert_tools
+
+    assert _convert_tools([{"type": "function"}, {"function": {}}]) == []
+
+
+# -- 响应解析 ---------------------------------------------------------------
+
+
+def test_parse_messages_response_text():
+    from botkit.llm.anthropic_backend import _parse_messages_response
+
+    resp = _parse_messages_response(
+        {"content": [{"type": "text", "text": "你好"}], "stop_reason": "end_turn"}
+    )
+    assert resp.content == "你好"
+    assert not resp.wants_tools
+
+
+def test_parse_messages_response_joins_text_blocks():
+    from botkit.llm.anthropic_backend import _parse_messages_response
+
+    resp = _parse_messages_response(
+        {"content": [{"type": "text", "text": "你"}, {"type": "text", "text": "好"}]}
+    )
+    assert resp.content == "你好"
+
+
+def test_parse_messages_response_tool_use():
+    from botkit.llm.anthropic_backend import _parse_messages_response
+
+    resp = _parse_messages_response(
+        {
+            "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "t", "input": {"a": 1}}
+            ],
+            "stop_reason": "tool_use",
+        }
+    )
+    assert resp.wants_tools
+    tc = resp.tool_calls[0]
+    assert tc.id == "toolu_1"
+    assert tc.name == "t"
+    assert tc.arguments == {"a": 1}
+
+
+def test_parse_messages_response_error_payload():
+    from botkit.llm.anthropic_backend import _parse_messages_response
+
+    with pytest.raises(LlmError, match="额度"):
+        _parse_messages_response({"type": "error", "error": {"message": "额度不足"}})
+
+
+def test_parse_messages_response_missing_content():
+    from botkit.llm.anthropic_backend import _parse_messages_response
+
+    with pytest.raises(LlmError, match="content"):
+        _parse_messages_response({"id": "msg_1"})
+
+
+# -- complete 端到端 --------------------------------------------------------
+
+
+async def test_anthropic_complete_builds_request():
+    backend = make_anthropic_backend(
+        _msg_response([{"type": "text", "text": "好"}])
+    )
+    resp = await backend.complete(
+        [{"role": "system", "content": "你是助手"}, {"role": "user", "content": "hi"}],
+        [],
+    )
+    assert resp.content == "好"
+
+    call = backend._session.post_calls[0]
+    # 路径自己拼 /messages
+    assert call["url"] == "http://fake/anthropic/v1/messages"
+    body = call["json"]
+    assert body["model"] == "anthropic.claude-sonnet-5"
+    assert body["system"] == "你是助手"
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
+    assert body["stream"] is False
+    # 没配 max_tokens 时兜底 8192
+    assert body["max_tokens"] == 8192
+    # tools 为空时不带这个字段
+    assert "tools" not in body
+
+
+async def test_anthropic_uses_x_api_key_by_default():
+    """
+    Anthropic 官方及兼容网关用 x-api-key。绝不能同时带 authorization ——
+    Anthropic 对同时出现两个认证头的请求直接返回 401。
+    """
+    backend = make_anthropic_backend(
+        _msg_response([{"type": "text", "text": "ok"}]),
+        api_url="https://api.anthropic.com/v1",
+    )
+    await backend.complete([{"role": "user", "content": "hi"}], [])
+    headers = backend._session.post_calls[0]["headers"]
+    assert headers["x-api-key"] == "sk-test"
+    assert "Authorization" not in headers
+    assert headers["anthropic-version"]
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+        "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+    ],
+)
+async def test_anthropic_uses_bearer_on_bedrock(api_url):
+    """Bedrock 认 Authorization: Bearer，这时不能带 x-api-key"""
+    backend = make_anthropic_backend(
+        _msg_response([{"type": "text", "text": "ok"}]), api_url=api_url
+    )
+    await backend.complete([{"role": "user", "content": "hi"}], [])
+    headers = backend._session.post_calls[0]["headers"]
+    assert headers["Authorization"] == "Bearer sk-test"
+    assert "x-api-key" not in headers
+
+
+def test_is_bedrock_host_detection():
+    from botkit.llm.anthropic_backend import _is_bedrock_host
+
+    assert _is_bedrock_host("https://bedrock-mantle.us-east-1.api.aws/anthropic/v1")
+    assert _is_bedrock_host("https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1")
+    assert not _is_bedrock_host("https://api.anthropic.com/v1")
+    assert not _is_bedrock_host("http://my-gateway.internal/anthropic/v1")
+    assert not _is_bedrock_host("")
+
+
+async def test_anthropic_max_tokens_from_config():
+    backend = make_anthropic_backend(
+        _msg_response([{"type": "text", "text": "ok"}]), max_tokens=1024
+    )
+    await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert backend._session.post_calls[0]["json"]["max_tokens"] == 1024
+
+
+async def test_anthropic_passes_tools():
+    backend = make_anthropic_backend(_msg_response([{"type": "text", "text": "ok"}]))
+    await backend.complete(
+        [{"role": "user", "content": "hi"}],
+        [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+    )
+    tools = backend._session.post_calls[0]["json"]["tools"]
+    assert tools[0]["name"] == "t"
+    assert "input_schema" in tools[0]
+
+
+async def test_anthropic_complete_http_error_includes_body():
+    backend = make_anthropic_backend(
+        FakeResponse(status=400, text='{"error":"bad model"}')
+    )
+    with pytest.raises(LlmError) as ei:
+        await backend.complete([], [])
+    assert "400" in str(ei.value)
+    assert "bad model" in str(ei.value)
+
+
+async def test_anthropic_passes_proxy():
+    backend = make_anthropic_backend(
+        _msg_response([{"type": "text", "text": "ok"}]),
+        http_proxy="http://127.0.0.1:7890",
+    )
+    await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert backend._session.post_calls[0]["proxy"] == "http://127.0.0.1:7890"
+
+
+# -- stream 端到端 ----------------------------------------------------------
+
+
+async def test_anthropic_stream_text_deltas():
+    lines = [
+        _sse({"type": "message_start"}),
+        _sse({"type": "content_block_start", "index": 0,
+              "content_block": {"type": "text"}}),
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "text_delta", "text": "你"}}),
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "text_delta", "text": "好"}}),
+        _sse({"type": "message_stop"}),
+    ]
+    backend = make_anthropic_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([{"role": "user", "content": "hi"}], []))
+
+    assert [c.delta for c in chunks if not c.done] == ["你", "好"]
+    done = chunks[-1]
+    assert done.done is True
+    assert done.response.content == "你好"
+    assert not done.response.wants_tools
+    assert backend._session.post_calls[0]["json"]["stream"] is True
+
+
+async def test_anthropic_stream_tool_use_assembled_from_partial_json():
+    """工具参数通过 input_json_delta 分片到达，要拼起来"""
+    lines = [
+        _sse({"type": "content_block_start", "index": 0,
+              "content_block": {"type": "tool_use", "id": "toolu_1",
+                                "name": "create_it_ticket"}}),
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "input_json_delta", "partial_json": '{"title"'}}),
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "input_json_delta", "partial_json": ':"修电脑"}'}}),
+        _sse({"type": "message_stop"}),
+    ]
+    backend = make_anthropic_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([], []))
+
+    # 工具轮没有文本增量
+    assert [c.delta for c in chunks if not c.done] == []
+    done = chunks[-1]
+    assert done.response.wants_tools
+    tc = done.response.tool_calls[0]
+    assert tc.id == "toolu_1"
+    assert tc.name == "create_it_ticket"
+    assert tc.arguments == {"title": "修电脑"}
+
+
+async def test_anthropic_stream_skips_bad_lines():
+    lines = [
+        b"\n",
+        b"event: content_block_delta\n",  # event 行忽略，类型在 data 里
+        b"data: {not json}\n",
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "text_delta", "text": "好"}}),
+        _sse({"type": "message_stop"}),
+    ]
+    backend = make_anthropic_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([], []))
+    assert [c.delta for c in chunks if not c.done] == ["好"]
+
+
+async def test_anthropic_stream_http_error():
+    backend = make_anthropic_backend(FakeStreamResponse([], status=500, text="boom"))
+    with pytest.raises(LlmError, match="500"):
+        await _collect(backend.stream([], []))
+
+
+async def test_anthropic_stream_error_event():
+    lines = [
+        _sse({"type": "error", "error": {"message": "超载了"}}),
+    ]
+    backend = make_anthropic_backend(FakeStreamResponse(lines))
+    with pytest.raises(LlmError, match="超载"):
+        await _collect(backend.stream([], []))
+
+
+async def test_anthropic_aclose_does_not_close_injected_session():
+    backend = make_anthropic_backend(_msg_response([]))
+    session = backend._session
+    await backend.aclose()
+    assert session.closed is False
