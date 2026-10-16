@@ -3,6 +3,12 @@
 *.env
 !.env.example
 
+# 门户用户表（含密码哈希），不进 git
+users.json
+node_modules/
+# 门户前端构建产物（由 npm build 生成，发布时打进 wheel）
+botkit/portal/static/
+
 # Python
 __pycache__/
 *.py[cod]
