@@ -1268,3 +1268,148 @@ async def test_anthropic_aclose_does_not_close_injected_session():
     session = backend._session
     await backend.aclose()
     assert session.closed is False
+
+
+# --------------------------------------------------------------------------
+# token 用量（usage）
+# --------------------------------------------------------------------------
+
+
+def test_token_usage_total_and_add():
+    from botkit.llm.base import TokenUsage
+
+    a = TokenUsage(input_tokens=10, output_tokens=5)
+    assert a.total_tokens == 15
+
+    b = TokenUsage(input_tokens=3, output_tokens=7)
+    s = a + b
+    assert (s.input_tokens, s.output_tokens, s.total_tokens) == (13, 12, 25)
+
+    # 加 None 等于不变（engine 里某轮没拿到用量时会这样）
+    s2 = a + None
+    assert (s2.input_tokens, s2.output_tokens) == (10, 5)
+
+
+def test_token_usage_falsy_when_empty():
+    """全 0 视为「没拿到用量」，engine 据此决定不打日志"""
+    from botkit.llm.base import TokenUsage
+
+    assert not TokenUsage()
+    assert TokenUsage(input_tokens=1)
+
+
+def test_parse_usage_accepts_both_namings():
+    from botkit.llm.base import parse_usage
+
+    openai_style = parse_usage({"prompt_tokens": 12, "completion_tokens": 34})
+    assert (openai_style.input_tokens, openai_style.output_tokens) == (12, 34)
+
+    anthropic_style = parse_usage({"input_tokens": 56, "output_tokens": 78})
+    assert (anthropic_style.input_tokens, anthropic_style.output_tokens) == (56, 78)
+
+
+def test_parse_usage_returns_none_when_absent():
+    from botkit.llm.base import parse_usage
+
+    assert parse_usage(None) is None
+    assert parse_usage({}) is None
+    assert parse_usage("坏数据") is None
+    # 全 0 也当没有
+    assert parse_usage({"input_tokens": 0, "output_tokens": 0}) is None
+
+
+def test_stream_accumulator_usage_overwrites_not_adds():
+    """
+    Anthropic 的 output_tokens 是累积值（不是增量），所以同一轮内多次
+    set_usage 必须按字段覆盖，累加会重复计入中间状态。
+    """
+    from botkit.llm.base import StreamAccumulator, TokenUsage
+
+    acc = StreamAccumulator()
+    acc.set_usage(TokenUsage(input_tokens=100))          # message_start
+    acc.set_usage(TokenUsage(output_tokens=10))          # message_delta（累积）
+    acc.set_usage(TokenUsage(output_tokens=25))          # message_delta（累积）
+
+    usage = acc.finish().usage
+    assert usage.input_tokens == 100
+    assert usage.output_tokens == 25     # 不是 35
+    assert usage.total_tokens == 125
+
+
+async def test_openai_complete_captures_usage():
+    class FakeUsage:
+        prompt_tokens = 11
+        completion_tokens = 22
+
+    completion = FakeCompletion([FakeChoice(FakeMessage(content="好"))])
+    completion.usage = FakeUsage()
+
+    backend = make_openai_backend(completion)
+    resp = await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert resp.usage.input_tokens == 11
+    assert resp.usage.output_tokens == 22
+
+
+async def test_openai_complete_without_usage_is_none():
+    backend = make_openai_backend(
+        FakeCompletion([FakeChoice(FakeMessage(content="好"))])
+    )
+    resp = await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert resp.usage is None
+
+
+async def test_aiohttp_complete_captures_usage():
+    backend = make_aiohttp_backend(
+        FakeResponse(
+            payload={
+                "choices": [{"message": {"content": "好"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 8},
+            }
+        )
+    )
+    resp = await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert (resp.usage.input_tokens, resp.usage.output_tokens) == (7, 8)
+
+
+async def test_aiohttp_stream_captures_usage():
+    """带 usage 的分片通常没有 choices，不能被提前跳过"""
+    lines = [
+        _sse({"choices": [{"delta": {"content": "好"}}]}),
+        _sse({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 6}}),
+        b"data: [DONE]\n",
+    ]
+    backend = make_aiohttp_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([], []))
+    usage = chunks[-1].response.usage
+    assert (usage.input_tokens, usage.output_tokens) == (5, 6)
+
+
+async def test_anthropic_complete_captures_usage():
+    backend = make_anthropic_backend(
+        FakeResponse(
+            payload={
+                "content": [{"type": "text", "text": "好"}],
+                "usage": {"input_tokens": 33, "output_tokens": 44},
+            }
+        )
+    )
+    resp = await backend.complete([{"role": "user", "content": "hi"}], [])
+    assert (resp.usage.input_tokens, resp.usage.output_tokens) == (33, 44)
+
+
+async def test_anthropic_stream_captures_usage_from_two_events():
+    """input_tokens 在 message_start，output_tokens 在 message_delta（累积值）"""
+    lines = [
+        _sse({"type": "message_start",
+              "message": {"usage": {"input_tokens": 120, "output_tokens": 1}}}),
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "text_delta", "text": "好"}}),
+        _sse({"type": "message_delta", "usage": {"output_tokens": 18}}),
+        _sse({"type": "message_stop"}),
+    ]
+    backend = make_anthropic_backend(FakeStreamResponse(lines))
+    chunks = await _collect(backend.stream([], []))
+    usage = chunks[-1].response.usage
+    assert usage.input_tokens == 120
+    assert usage.output_tokens == 18
+    assert usage.total_tokens == 138

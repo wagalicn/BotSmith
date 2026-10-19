@@ -111,6 +111,9 @@ Built in, so you don't have to worry about it:
   and tool calling plus streaming behave the same to upper layers
 - **Restricted endpoints**: `llm.http_proxy` routes LLM requests through a proxy, for endpoints with
   regional or network restrictions (supported on both protocols)
+- **Token usage**: logs one accumulated token line at the end of each turn (a turn with tool calls hits
+  the LLM several times, so the figure is the per-turn total). Nothing is logged when the endpoint
+  doesn't report usage, keeping the log clean
 - **External chat API**: a single `POST /chat` exposes the Agent to Dify / an internal portal / any third party
 - **Custom HTTP endpoints**: when an Agent needs a dedicated endpoint beyond `/chat`, attach it via the `register_routes`
   extension point without changing the skeleton. **This one requires Python code** (unlike the dialog/tools/copy that are pure config),

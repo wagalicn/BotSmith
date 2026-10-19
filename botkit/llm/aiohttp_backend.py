@@ -27,6 +27,7 @@ from botkit.llm.base import (
     StreamAccumulator,
     StreamChunk,
     normalize_response,
+    parse_usage,
 )
 
 logger = logging.getLogger("botkit.llm.aiohttp")
@@ -186,7 +187,11 @@ def _parse_openai_payload(data: Any) -> LlmResponse:
         logger.warning("tool_calls 不是列表，忽略：%r", raw_tool_calls)
         raw_tool_calls = []
 
-    return normalize_response(content, [tc for tc in raw_tool_calls if isinstance(tc, dict)])
+    return normalize_response(
+        content,
+        [tc for tc in raw_tool_calls if isinstance(tc, dict)],
+        parse_usage(data.get("usage")),
+    )
 
 
 def _iter_stream_deltas(data: Any, acc: StreamAccumulator):
@@ -199,6 +204,14 @@ def _iter_stream_deltas(data: Any, acc: StreamAccumulator):
     """
     if not isinstance(data, dict):
         return
+
+    # 用量在 choices 之前处理：带 usage 的分片通常没有 choices，
+    # 放到后面会被提前 return 掉。OpenAI 协议下流式默认不给 usage
+    # （需请求时带 stream_options.include_usage），端点给了就记下。
+    usage = parse_usage(data.get("usage"))
+    if usage is not None:
+        acc.set_usage(usage)
+
     choices = data.get("choices")
     if not choices or not isinstance(choices, list):
         return

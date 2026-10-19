@@ -25,6 +25,7 @@ from botkit.llm.base import (
     StreamAccumulator,
     StreamChunk,
     normalize_response,
+    parse_usage,
 )
 
 logger = logging.getLogger("botkit.llm.openai")
@@ -92,7 +93,18 @@ class OpenAIBackend:
                 }
             )
 
-        return normalize_response(msg.content, raw_tool_calls)
+        # SDK 返回的是对象，转成 dict 交给统一的解析
+        usage_obj = getattr(resp, "usage", None)
+        usage = parse_usage(
+            {
+                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+            }
+            if usage_obj is not None
+            else None
+        )
+
+        return normalize_response(msg.content, raw_tool_calls, usage)
 
     async def stream(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -109,6 +121,27 @@ class OpenAIBackend:
         try:
             stream = await self._client.chat.completions.create(**kwargs)
             async for chunk in stream:
+                # 用量要在 choices 判空之前取：带 usage 的那个 chunk 通常
+                # choices 是空的，放到后面会被 continue 跳过。
+                #
+                # 注意 OpenAI 协议下流式默认**不返回** usage，要请求时带
+                # stream_options={"include_usage": true} 才有。这里不主动加该参数
+                # ——部分兼容端点不认它会直接 400。端点愿意给就记下，不给就是 None。
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    acc.set_usage(
+                        parse_usage(
+                            {
+                                "prompt_tokens": getattr(
+                                    chunk_usage, "prompt_tokens", 0
+                                ),
+                                "completion_tokens": getattr(
+                                    chunk_usage, "completion_tokens", 0
+                                ),
+                            }
+                        )
+                    )
+
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
