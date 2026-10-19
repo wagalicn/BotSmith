@@ -1021,3 +1021,72 @@ def test_delete_skill_without_references(project, two_bots):
     assert result["cleaned"] == []
     assert result["skipped"] == []
     assert [s["name"] for s in result["skills"]] == ["faq.md"]
+
+
+# --------------------------------------------------------------------------
+# 用量查看 read_usage
+# --------------------------------------------------------------------------
+
+
+def _write_usage(bot_dir: Path, month: str, rows: list[dict]):
+    import json
+
+    usage = bot_dir / "usage"
+    usage.mkdir(exist_ok=True)
+    lines = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n"
+    (usage / f"usage-{month}.jsonl").write_text(lines, encoding="utf-8")
+
+
+def test_read_usage_empty_when_no_data(project, bot):
+    result = service.read_usage(project, "hr-bot")
+    assert result["months"] == []
+    assert result["current"] is None
+    assert result["summary"]["turns"] == 0
+    assert result["detail"] == []
+
+
+def test_read_usage_latest_month_by_default(project, bot):
+    _write_usage(bot, "202609", [{"input_tokens": 1, "output_tokens": 1,
+                                   "total_tokens": 2, "success": True}])
+    _write_usage(bot, "202610", [
+        {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+         "tool_calls": 1, "elapsed_ms": 1000, "success": True, "question": "a"},
+        {"input_tokens": 200, "output_tokens": 30, "total_tokens": 230,
+         "tool_calls": 0, "elapsed_ms": 3000, "success": False, "question": "b"},
+    ])
+
+    result = service.read_usage(project, "hr-bot")
+    # 默认取最新月
+    assert result["current"] == "202610"
+    assert result["months"] == ["202610", "202609"]
+    s = result["summary"]
+    assert s["turns"] == 2
+    assert s["total_tokens"] == 350
+    assert s["success_count"] == 1
+    assert s["success_rate"] == 0.5
+    # 明细最新在前
+    assert [r["question"] for r in result["detail"]] == ["b", "a"]
+
+
+def test_read_usage_specific_month(project, bot):
+    _write_usage(bot, "202609", [{"input_tokens": 5, "output_tokens": 5,
+                                   "total_tokens": 10, "success": True}])
+    _write_usage(bot, "202610", [{"input_tokens": 1, "output_tokens": 1,
+                                   "total_tokens": 2, "success": True}])
+
+    result = service.read_usage(project, "hr-bot", "202609")
+    assert result["current"] == "202609"
+    assert result["summary"]["total_tokens"] == 10
+
+
+def test_read_usage_bad_month_falls_back_to_latest(project, bot):
+    _write_usage(bot, "202610", [{"input_tokens": 1, "output_tokens": 1,
+                                   "total_tokens": 2, "success": True}])
+    # 传了不存在的月份 → 回退到最新有数据的月
+    result = service.read_usage(project, "hr-bot", "209912")
+    assert result["current"] == "202610"
+
+
+def test_read_usage_rejects_path_traversal(project):
+    with pytest.raises(UiError):
+        service.read_usage(project, "../etc")

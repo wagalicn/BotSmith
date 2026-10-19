@@ -26,11 +26,13 @@ const state = {
   skillsLoaded: false, // 技能清单拉到过没有；没拉到之前不判断引用是否失效
   preview: { history: [], turns: [], busy: false }, // 当前 Agent 的预览对话
   previews: {},      // 按 Agent 名存预览，切回来能恢复：name -> {history, turns, busy}
+  usage: null,       // 当前 Agent 当前月的用量 {name, months, current, summary, detail}
+  usageLoading: false,
 };
 
 const TAB_IDS = [
   "secrets", "llm", "tools", "identity", "prompt", "skills",
-  "session", "messages", "intercepts", "api", "preview", "advanced",
+  "session", "messages", "intercepts", "api", "preview", "usage", "advanced",
 ];
 
 // ---------------------------------------------------------------- 工具函数
@@ -1436,6 +1438,7 @@ function render() {
   renderIntercepts();
   renderApi();
   renderPreview();
+  renderUsage();
   renderAdvanced();
 }
 
@@ -1916,6 +1919,147 @@ function clearPreview() {
   renderPreview();
 }
 
+// ---------------------------------------------------------------- 用量
+
+/** 千分位，便于看大数（token 动辄上万） */
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString();
+}
+
+/**
+ * 「用量」tab：只读查看本地落盘的用量。懒加载——进这个 tab 才拉数据，
+ * 切 Agent 后 state.usage 被清空，下次进来重新拉。月份下拉切换会重新请求。
+ */
+function renderUsage() {
+  const cards = $("#usage-cards");
+  const detail = $("#usage-detail");
+  const monthSel = $("#usage-month");
+  if (!cards || !detail || !monthSel) return;
+
+  // 只在当前就是 usage tab 时才拉数据，避免每次 render 都请求
+  if (state.activeTab !== "usage") return;
+
+  if (state.usage === null && !state.usageLoading) {
+    loadUsage();
+    return;
+  }
+  if (state.usageLoading || state.usage === null) {
+    cards.replaceChildren(note("", t("status.reading")));
+    detail.replaceChildren();
+    monthSel.replaceChildren();
+    return;
+  }
+
+  const u = state.usage;
+
+  // 月份下拉
+  monthSel.replaceChildren();
+  for (const m of u.months) {
+    monthSel.append(el("option", { value: m, text: fmtMonth(m), selected: m === u.current }));
+  }
+  monthSel.onchange = () => loadUsage(monthSel.value);
+  monthSel.disabled = u.months.length === 0;
+
+  // 没有任何记录
+  if (!u.current || u.summary.turns === 0) {
+    cards.replaceChildren();
+    detail.replaceChildren(note("", t("usage.empty")));
+    return;
+  }
+
+  // 指标卡
+  const s = u.summary;
+  const rate = s.success_rate === null ? "—" : Math.round(s.success_rate * 100) + "%";
+  cards.replaceChildren(
+    usageCard("usage.card_turns", fmtNum(s.turns)),
+    usageCard("usage.card_total_tokens", fmtNum(s.total_tokens)),
+    usageCard("usage.card_io_tokens", `${fmtNum(s.input_tokens)} / ${fmtNum(s.output_tokens)}`),
+    usageCard("usage.card_tool_calls", fmtNum(s.tool_calls)),
+    usageCard("usage.card_success_rate", rate),
+    usageCard("usage.card_avg_elapsed", t("usage.ms", { n: fmtNum(s.avg_elapsed_ms) })),
+  );
+
+  // 明细表
+  detail.replaceChildren(
+    el("h3", { text: t("usage.detail_h3") }),
+    el("p", { class: "hint", text: t("usage.detail_hint") }),
+    usageTable(u.detail),
+  );
+}
+
+function usageCard(labelKey, value) {
+  return el("div", { class: "usage-card" }, [
+    el("div", { class: "usage-card-value", text: value }),
+    el("div", { class: "usage-card-label", text: t(labelKey) }),
+  ]);
+}
+
+/** YYYYMM -> "2026-10"，下拉里好认 */
+function fmtMonth(m) {
+  if (!/^\d{6}$/.test(m)) return m;
+  return m.slice(0, 4) + "-" + m.slice(4);
+}
+
+/** ISO8601 时间戳截到「MM-DD HH:MM」，省掉年和时区，表格里够看 */
+function fmtTs(ts) {
+  const s = String(ts || "");
+  const m = s.match(/^\d{4}-(\d{2}-\d{2})T(\d{2}:\d{2})/);
+  return m ? `${m[1]} ${m[2]}` : s;
+}
+
+function usageTable(rows) {
+  const table = el("table", { class: "usage-table" });
+  const cols = [
+    "usage.col_ts", "usage.col_identity", "usage.col_source", "usage.col_model",
+    "usage.col_in", "usage.col_out", "usage.col_total", "usage.col_tools",
+    "usage.col_elapsed", "usage.col_ok", "usage.col_question",
+  ];
+  table.append(
+    el("thead", {}, el("tr", {}, cols.map((c) => el("th", { text: t(c) }))))
+  );
+  const body = el("tbody");
+  for (const r of rows) {
+    const ok = r.success !== false;
+    body.append(
+      el("tr", {}, [
+        el("td", { text: fmtTs(r.ts) }),
+        el("td", { text: r.identity || "—" }),
+        el("td", { text: r.source || "—" }),
+        el("td", { text: r.model || "—" }),
+        el("td", { class: "num", text: fmtNum(r.input_tokens) }),
+        el("td", { class: "num", text: fmtNum(r.output_tokens) }),
+        el("td", { class: "num", text: fmtNum(r.total_tokens) }),
+        el("td", { class: "num", text: fmtNum(r.tool_calls) }),
+        el("td", { class: "num", text: fmtNum(r.elapsed_ms) }),
+        el("td", {}, el("span", {
+          class: "usage-badge " + (ok ? "ok" : "bad"),
+          text: ok ? t("usage.ok_yes") : t("usage.ok_no"),
+        })),
+        el("td", { class: "usage-q", title: r.question || "", text: r.question || "" }),
+      ])
+    );
+  }
+  table.append(body);
+  return table;
+}
+
+/** 拉某个 Agent 某月的用量。month 省略时后端给最新有数据的月。 */
+async function loadUsage(month) {
+  if (!state.current) return;
+  state.usageLoading = true;
+  renderUsage();
+  try {
+    const q = month ? `?month=${encodeURIComponent(month)}` : "";
+    state.usage = await api("GET", `/api/bots/${encodeURIComponent(state.current)}/usage${q}`);
+  } catch (e) {
+    state.usage = { months: [], current: null, summary: { turns: 0 }, detail: [] };
+    setStatus(t("usage.load_fail", { error: e.message }), "bad");
+  } finally {
+    state.usageLoading = false;
+    renderUsage();
+  }
+}
+
 // ---------------------------------------------------------------- 数据加载
 
 async function loadBots() {
@@ -1939,6 +2083,7 @@ async function selectBot(name) {
     // 恢复该 Agent 上次的预览对话（切走再切回不丢）；没有就开一段新的
     state.preview = state.previews[data.name] || { history: [], turns: [], busy: false };
     state.previews[data.name] = state.preview;
+    state.usage = null;   // 切 Agent 后清掉用量缓存，进「用量」tab 再懒加载
     state.dirty = false;
     // 保留用户当前所在的 tab，不强制回「密钥」页
     clearProbeResults();

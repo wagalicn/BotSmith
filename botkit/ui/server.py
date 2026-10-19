@@ -183,6 +183,12 @@ async def api_check_prompt(request: web.Request) -> web.Response:
     return web.json_response(service.check_prompt(str(payload.get("prompt", ""))))
 
 
+async def api_usage(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    month = request.query.get("month") or None
+    return web.json_response(service.read_usage(_root(request), name, month))
+
+
 async def api_validate_bot(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     bot_dir = service.bot_dir_for(_root(request), name)
@@ -369,6 +375,7 @@ def create_app(project_root: Path | str = ".") -> web.Application:
     app.router.add_post("/api/bots/{name}/probe/wecom", api_probe_wecom)
     app.router.add_post("/api/bots/{name}/preview", api_preview)
     app.router.add_post("/api/bots/{name}/preview/stream", api_preview_stream)
+    app.router.add_get("/api/bots/{name}/usage", api_usage)
     app.router.add_post("/api/prompt/check", api_check_prompt)
     app.router.add_get("/api/skills", api_list_skills)
     app.router.add_post("/api/skills", api_upload_skill)

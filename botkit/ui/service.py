@@ -1855,3 +1855,41 @@ def form_options() -> dict[str, Any]:
             "log_levels": list(VALID_LOG_LEVELS),
         },
     }
+
+
+# --------------------------------------------------------------------------
+# 用量查看
+# --------------------------------------------------------------------------
+
+
+def read_usage(
+    root: Path | str, name: str, month: str | None = None
+) -> dict[str, Any]:
+    """
+    读某个 Agent 的用量，供配置页「用量」tab 展示。
+
+    骨架在每轮对话结束后把用量按月落盘到 bots/<agent>/usage/usage-YYYYMM.jsonl
+    （无条件内置、不进 git）。这里读出来：返回可选月份列表、当前查看的月份、
+    该月的指标聚合和明细（最新在前）。
+
+    month 省略时取最新有数据的月份；没有任何数据时 months 为空、current 为 None。
+    """
+    from botkit.usage import JsonlUsageStore, summarize
+
+    bot_dir = bot_dir_for(root, name)
+    store = JsonlUsageStore(bot_dir)
+
+    months = store.list_months()
+    current = month if (month and month in months) else (months[0] if months else None)
+
+    rows = store.read_month(current) if current else []
+    # 明细最新在前，和看板习惯一致（落盘是追加写，所以末尾最新）
+    detail = list(reversed(rows))
+
+    return {
+        "name": bot_dir.name,
+        "months": months,
+        "current": current,
+        "summary": summarize(rows),
+        "detail": detail,
+    }

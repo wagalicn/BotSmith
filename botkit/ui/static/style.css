@@ -578,3 +578,70 @@ dialog label { display: block; font-weight: 600; margin-bottom: 4px; }
   .sidebar { width: auto; flex: none; border-right: none; border-bottom: 1px solid var(--border); }
   .actionbar { left: 0; }
 }
+
+/* ---- 用量 tab ---- */
+.usage-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 16px 0 20px;
+}
+.usage-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.usage-card-value {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.2;
+}
+.usage-card-label {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-top: 10px;
+}
+.usage-table th,
+.usage-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+.usage-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.usage-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.usage-table td.usage-q {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.usage-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+.usage-badge.ok {
+  color: var(--ok);
+  background: var(--ok-bg);
+}
+.usage-badge.bad {
+  color: var(--err);
+  background: var(--err-bg);
+}
