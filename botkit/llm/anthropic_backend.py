@@ -46,6 +46,7 @@ from botkit.llm.base import (
     StreamAccumulator,
     StreamChunk,
     normalize_response,
+    parse_usage,
 )
 
 logger = logging.getLogger("botkit.llm.anthropic")
@@ -404,7 +405,7 @@ def _parse_messages_response(data: Any) -> LlmResponse:
             )
 
     content = "".join(text_parts) or None
-    return normalize_response(content, raw_tool_calls)
+    return normalize_response(content, raw_tool_calls, parse_usage(data.get("usage")))
 
 
 # --------------------------------------------------------------------------
@@ -428,6 +429,18 @@ def _handle_stream_event(
     if not isinstance(event, dict):
         return
     etype = event.get("type")
+
+    # 用量分两处到达：message_start 给 input_tokens，message_delta 给
+    # output_tokens（且是**累积值**）。set_usage 按字段覆盖，正好对上。
+    if etype == "message_start":
+        message = event.get("message")
+        if isinstance(message, dict):
+            acc.set_usage(parse_usage(message.get("usage")))
+        return
+
+    if etype == "message_delta":
+        acc.set_usage(parse_usage(event.get("usage")))
+        return
 
     if etype == "content_block_start":
         block = event.get("content_block")

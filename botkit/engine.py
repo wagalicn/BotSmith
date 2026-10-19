@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from botkit.config import BotConfig, ContentWatcher
 from botkit.hooks import HookContext, Hooks
-from botkit.llm.base import LlmBackend, LlmError
+from botkit.llm.base import LlmBackend, LlmError, TokenUsage
 from botkit.mcp_client import McpToolClient
 
 logger = logging.getLogger("botkit.engine")
@@ -136,6 +136,9 @@ class BotEngine:
         messages.append({"role": "user", "content": user_message})
 
         max_rounds = self.config.llm.max_tool_rounds
+        # 一轮对话里 function calling 可能调多次 LLM，token 要跨轮累加
+        total_usage = TokenUsage()
+        llm_calls = 0
 
         async with self.mcp.session(identity=identity) as sess:
             tools = await sess.list_tools_openai()
@@ -143,6 +146,8 @@ class BotEngine:
             for round_i in range(1, max_rounds + 1):
                 logger.debug("第 %d/%d 轮请求 LLM", round_i, max_rounds)
                 resp = await self.backend.complete(messages, tools)
+                total_usage = total_usage + resp.usage
+                llm_calls += 1
 
                 if not resp.wants_tools:
                     reply = (resp.content or "").strip()
@@ -150,6 +155,7 @@ class BotEngine:
                         logger.warning("LLM 既没有工具调用也没有文本回复")
                         raise LlmError("LLM 返回了空回复")
                     logger.info("第 %d 轮得到最终回复（%d 字）", round_i, len(reply))
+                    _log_usage(total_usage, llm_calls)
                     return reply
 
                 # 有工具调用：身份注入、hook 改写、调用并回灌结果
@@ -159,6 +165,7 @@ class BotEngine:
 
         # 轮次用完还没给出文本回复，通常是模型在反复调工具打转
         logger.warning("工具调用轮次达到上限 %d，放弃本轮", max_rounds)
+        _log_usage(total_usage, llm_calls)
         return self.config.messages.tool_rounds_exceeded
 
     async def chat_stream(
@@ -198,6 +205,8 @@ class BotEngine:
         messages.append({"role": "user", "content": user_message})
 
         max_rounds = self.config.llm.max_tool_rounds
+        total_usage = TokenUsage()
+        llm_calls = 0
 
         async with self.mcp.session(identity=identity) as sess:
             tools = await sess.list_tools_openai()
@@ -218,12 +227,16 @@ class BotEngine:
                 if resp is None:
                     raise LlmError("流式返回没有收尾（缺少 done 片段）")
 
+                total_usage = total_usage + resp.usage
+                llm_calls += 1
+
                 if not resp.wants_tools:
                     # 这一轮是最终答复
                     if not produced.strip() and not (resp.content or "").strip():
                         logger.warning("LLM 既没有工具调用也没有文本回复")
                         raise LlmError("LLM 返回了空回复")
                     logger.info("第 %d 轮得到最终回复（流式）", round_i)
+                    _log_usage(total_usage, llm_calls)
                     return
 
                 # 工具调用轮：和 chat 完全一样地处理
@@ -232,6 +245,7 @@ class BotEngine:
                 )
 
         logger.warning("工具调用轮次达到上限 %d，放弃本轮", max_rounds)
+        _log_usage(total_usage, llm_calls)
         yield self.config.messages.tool_rounds_exceeded
 
     async def _execute_tool_calls(
@@ -294,6 +308,26 @@ class BotEngine:
 
     async def aclose(self) -> None:
         await self.backend.aclose()
+
+
+def _log_usage(usage: TokenUsage, llm_calls: int) -> None:
+    """
+    一轮对话结束时记一次 token 消耗。
+
+    带工具调用的对话会多次请求 LLM（每次都把全部历史重发一遍），所以这里
+    打的是**本轮累计**，比单次调用的数字更能反映真实成本。
+
+    端点不返回用量时（usage 全为 0）不打这行，免得日志里一堆没意义的 0。
+    """
+    if not usage:
+        return
+    logger.info(
+        "本轮 token：输入 %d，输出 %d，合计 %d（%d 次 LLM 调用）",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        llm_calls,
+    )
 
 
 def _sync_tool_call_args(

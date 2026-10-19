@@ -39,10 +39,72 @@ class ToolCall:
 
 
 @dataclass
+class TokenUsage:
+    """
+    一次 LLM 调用消耗的 token。
+
+    字段名用协议中立的 input/output：OpenAI 协议叫 prompt_tokens /
+    completion_tokens，Anthropic Messages 叫 input_tokens / output_tokens，
+    各后端解析时统一到这里。
+
+    支持相加，方便把一轮对话里多次 LLM 调用（function calling 循环会调多次）
+    累加成总量。
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def __add__(self, other: "TokenUsage | None") -> "TokenUsage":
+        if other is None:
+            return TokenUsage(self.input_tokens, self.output_tokens)
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+        )
+
+    def __bool__(self) -> bool:
+        """全为 0 时视为「没拿到用量」，日志里可据此跳过"""
+        return bool(self.input_tokens or self.output_tokens)
+
+
+def parse_usage(raw: Any) -> TokenUsage | None:
+    """
+    从响应里的 usage 字段解析出 TokenUsage。
+
+    同时认两套命名（OpenAI 的 prompt/completion、Anthropic 的 input/output），
+    所以三个后端都能直接用它。拿不到就返回 None —— 有些端点不返回用量，
+    这不是错误，只是没有这项数据。
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _int(*keys: str) -> int:
+        for key in keys:
+            val = raw.get(key)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, (int, float)):
+                return int(val)
+        return 0
+
+    usage = TokenUsage(
+        input_tokens=_int("input_tokens", "prompt_tokens"),
+        output_tokens=_int("output_tokens", "completion_tokens"),
+    )
+    return usage if usage else None
+
+
+@dataclass
 class LlmResponse:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
     message: dict[str, Any] = field(default_factory=dict)
+    # 本次调用的 token 用量。None = 端点没返回这项数据
+    usage: TokenUsage | None = None
 
     @property
     def wants_tools(self) -> bool:
@@ -142,12 +204,16 @@ def build_assistant_message(
 
 
 def normalize_response(
-    content: str | None, raw_tool_calls: list[dict[str, Any]]
+    content: str | None,
+    raw_tool_calls: list[dict[str, Any]],
+    usage: TokenUsage | None = None,
 ) -> LlmResponse:
     """
     把「文本 + 原始 tool_calls 字典列表」变成 LlmResponse。
     raw_tool_calls 里每项形如
         {"id": ..., "function": {"name": ..., "arguments": "<json 字符串>"}}
+
+    usage 可选：端点返回了 token 用量就带上，供上层累加和记日志。
     """
     tool_calls: list[ToolCall] = []
     for i, raw in enumerate(raw_tool_calls or []):
@@ -173,6 +239,7 @@ def normalize_response(
         content=content,
         tool_calls=tool_calls,
         message=build_assistant_message(content, tool_calls),
+        usage=usage,
     )
 
 
@@ -195,6 +262,7 @@ class StreamAccumulator:
         self._text_parts: list[str] = []
         # index -> {"id": str, "name": str, "arguments": str}
         self._tool_calls: dict[int, dict[str, str]] = {}
+        self._usage: TokenUsage | None = None
 
     def add_text(self, delta: str | None) -> str:
         """累加一段文本增量，返回这段增量（空则返回空串，便于调用方直接推送）"""
@@ -222,6 +290,30 @@ class StreamAccumulator:
         if arguments:
             slot["arguments"] += arguments
 
+    def set_usage(self, usage: TokenUsage | None) -> None:
+        """
+        记下这次流式调用的 token 用量。可多次调用，按字段合并：
+        **非零值覆盖旧值，而不是相加。**
+
+        覆盖而非累加是为了同时适配两种协议：
+        - OpenAI：用量在最后一个 chunk 一次性给全，覆盖即正确；
+        - Anthropic：input_tokens 在 message_start 给，output_tokens 在
+          message_delta 给，而且后者是**累积值**（不是增量），
+          累加会把中间状态重复计入。
+
+        跨轮累加是另一回事（一轮对话里 function calling 会多次调 LLM），
+        那个用 TokenUsage 的 `+`，由 engine 负责。
+        """
+        if usage is None:
+            return
+        if self._usage is None:
+            self._usage = TokenUsage(usage.input_tokens, usage.output_tokens)
+            return
+        if usage.input_tokens:
+            self._usage.input_tokens = usage.input_tokens
+        if usage.output_tokens:
+            self._usage.output_tokens = usage.output_tokens
+
     @property
     def text(self) -> str:
         return "".join(self._text_parts)
@@ -239,4 +331,4 @@ class StreamAccumulator:
             for idx in sorted(self._tool_calls)
         ]
         content = self.text or None
-        return normalize_response(content, raw_tool_calls)
+        return normalize_response(content, raw_tool_calls, self._usage)

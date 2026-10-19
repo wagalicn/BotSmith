@@ -25,21 +25,25 @@ from botkit.llm.base import (
     LlmBackend,
     LlmError,
     LlmResponse,
+    TokenUsage,
     ToolCall,
     build_assistant_message,
     normalize_response,
     parse_tool_arguments,
+    parse_usage,
 )
 
 __all__ = [
     "LlmBackend",
     "LlmError",
     "LlmResponse",
+    "TokenUsage",
     "ToolCall",
     "build_assistant_message",
     "create_backend",
     "normalize_response",
     "parse_tool_arguments",
+    "parse_usage",
 ]
 
 

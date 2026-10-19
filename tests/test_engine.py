@@ -865,3 +865,89 @@ async def test_chat_stream_progress_callback_on_tool_round():
     )
     # 工具轮推了进度（和 chat 一致）
     assert len(progress.labels) >= 1
+
+
+# --------------------------------------------------------------------------
+# token 用量跨轮累加
+# --------------------------------------------------------------------------
+
+
+class UsageBackend:
+    """假后端：每次调用返回预设的 (content, tool_calls, usage)"""
+
+    name = "usage"
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.closed = False
+
+    def _next(self):
+        content, tool_calls, usage = self._script.pop(0)
+        from botkit.llm.base import TokenUsage
+
+        return normalize_response(
+            content,
+            tool_calls,
+            TokenUsage(input_tokens=usage[0], output_tokens=usage[1]),
+        )
+
+    async def complete(self, messages, tools):
+        return self._next()
+
+    async def stream(self, messages, tools):
+        resp = self._next()
+        if not resp.wants_tools and resp.content:
+            for ch in resp.content:
+                yield StreamChunk(delta=ch)
+        yield StreamChunk(done=True, response=resp)
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def test_usage_accumulated_across_tool_rounds(caplog):
+    """
+    一轮对话里 function calling 调了两次 LLM，日志里的 token 应该是两次之和。
+    """
+    backend = UsageBackend(
+        [
+            (None, [tool_call("get_system_config", {})], (100, 20)),
+            ("查到了", [], (150, 30)),
+        ]
+    )
+    engine, _ = make_engine(backend)
+
+    with caplog.at_level(logging.INFO, logger="botkit.engine"):
+        reply = await engine.chat("查配置", identity="L220104")
+
+    assert reply == "查到了"
+    line = next(r.getMessage() for r in caplog.records if "本轮 token" in r.getMessage())
+    # 输入 100+150=250，输出 20+30=50，合计 300，2 次调用
+    assert "输入 250" in line
+    assert "输出 50" in line
+    assert "合计 300" in line
+    assert "2 次 LLM 调用" in line
+
+
+async def test_usage_logged_for_stream_too(caplog):
+    backend = UsageBackend([("你好", [], (12, 34))])
+    engine, _ = make_engine(backend)
+
+    with caplog.at_level(logging.INFO, logger="botkit.engine"):
+        tokens = [t async for t in engine.chat_stream("hi", identity="L220104")]
+
+    assert "".join(tokens) == "你好"
+    line = next(r.getMessage() for r in caplog.records if "本轮 token" in r.getMessage())
+    assert "输入 12" in line
+    assert "输出 34" in line
+
+
+async def test_no_usage_line_when_backend_reports_nothing(caplog):
+    """端点不返回用量时不该打一行全是 0 的日志"""
+    backend = ScriptedBackend([("你好", [])])
+    engine, _ = make_engine(backend)
+
+    with caplog.at_level(logging.INFO, logger="botkit.engine"):
+        await engine.chat("hi", identity="L220104")
+
+    assert not any("本轮 token" in r.getMessage() for r in caplog.records)
