@@ -14,13 +14,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from botkit.config import BotConfig, DiscoveredBot, discover_api_bots
 from botkit.engine import BotEngine, IdentityRejected, identity_matches
-from botkit.hooks import HookContext, Hooks, load_hooks
+from botkit.hooks import HookContext, Hooks, TurnStats, load_hooks
 from botkit.llm import create_backend
 from botkit.logging_setup import setup_logging
 from botkit.mcp_client import McpToolClient
@@ -202,11 +204,51 @@ class MessagePipeline:
 
     # -- 主流程 ------------------------------------------------------------
 
+    async def _fire_usage_hook(
+        self,
+        captured: dict[str, Any],
+        ctx: HookContext,
+        *,
+        identity: str | None,
+        question: str,
+        request_id: str,
+        started_at: float,
+        source: str,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        """
+        组装 TurnStats 并触发 on_usage hook。
+
+        captured 是 engine 回调塞进来的 {usage, tool_calls}；没进 LLM（前置拦截）
+        或 engine 没回调时 captured 为空，这轮没有真实消耗，就不触发 hook。
+        hook 内部出错由 Hooks.on_usage 吞掉，不影响已给用户的回复。
+        """
+        if "usage" not in captured:
+            return
+        usage = captured["usage"]
+        stats = TurnStats(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            model=self.config.llm.model,
+            tool_calls=captured.get("tool_calls", 0),
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            identity=identity,
+            question=question,
+            source=source,
+            success=success,
+            error=error,
+            agent_name=self.config.name,
+            request_id=request_id,
+        )
+        await self.hooks.on_usage(stats, ctx)
+
     async def handle(
         self,
         frame: dict[str, Any],
         on_progress: ProgressCallback | None = None,
         on_tool_call: ToolCallObserver | None = None,
+        source: str = "",
     ) -> Reply:
         """
         处理一条文本消息，返回该发给用户的内容。
@@ -233,6 +275,16 @@ class MessagePipeline:
 
         history = self.sessions.get_history(session_key)
 
+        # 用量统计：engine 收尾时把 (usage, tool_calls) 塞进 captured，
+        # 本方法随后组装 TurnStats 触发 on_usage hook。
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        started_at = time.monotonic()
+        captured: dict[str, Any] = {}
+
+        async def _grab_usage(usage, tool_calls) -> None:
+            captured["usage"] = usage
+            captured["tool_calls"] = tool_calls
+
         try:
             reply = await self.engine.chat(
                 content,
@@ -241,6 +293,7 @@ class MessagePipeline:
                 on_progress=on_progress,
                 hook_context=ctx,
                 on_tool_call=on_tool_call,
+                on_usage=_grab_usage,
             )
         except IdentityRejected:
             # 上面已经校验过，走到这里说明配置或代码有问题
@@ -249,10 +302,26 @@ class MessagePipeline:
         except BaseExceptionGroup as eg:
             # TaskGroup 里的异常会被包成组，只打组本身看不出真正的错
             _log_exception_group(eg)
+            await self._fire_usage_hook(
+                captured, ctx, identity=identity, question=content,
+                request_id=request_id, started_at=started_at, source=source,
+                success=False, error="exception_group",
+            )
             return Reply(msgs.error, KIND_ERROR)
-        except Exception:
+        except Exception as e:
             logger.exception("处理消息时出错")
+            await self._fire_usage_hook(
+                captured, ctx, identity=identity, question=content,
+                request_id=request_id, started_at=started_at, source=source,
+                success=False, error=type(e).__name__,
+            )
             return Reply(msgs.error, KIND_ERROR)
+
+        await self._fire_usage_hook(
+            captured, ctx, identity=identity, question=content,
+            request_id=request_id, started_at=started_at, source=source,
+            success=True,
+        )
 
         # 配置式回复加工：给 LLM 正常回复追加固定后缀（署名等）。
         # 先于 before_reply hook —— 配置是常规手段，hook 可再改写。
@@ -277,6 +346,7 @@ class MessagePipeline:
         frame: dict[str, Any],
         on_progress: ProgressCallback | None = None,
         on_tool_call: ToolCallObserver | None = None,
+        source: str = "",
     ) -> AsyncIterator[tuple[str, str]]:
         """
         handle 的流式版本（SSE 用）。逐段 yield (kind, text_piece)。
@@ -307,6 +377,14 @@ class MessagePipeline:
 
         history = self.sessions.get_history(session_key)
 
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        started_at = time.monotonic()
+        captured: dict[str, Any] = {}
+
+        async def _grab_usage(usage, tool_calls) -> None:
+            captured["usage"] = usage
+            captured["tool_calls"] = tool_calls
+
         parts: list[str] = []
         try:
             async for piece in self.engine.chat_stream(
@@ -316,6 +394,7 @@ class MessagePipeline:
                 on_progress=on_progress,
                 hook_context=ctx,
                 on_tool_call=on_tool_call,
+                on_usage=_grab_usage,
             ):
                 if piece:
                     parts.append(piece)
@@ -326,13 +405,29 @@ class MessagePipeline:
             return
         except BaseExceptionGroup as eg:
             _log_exception_group(eg)
+            await self._fire_usage_hook(
+                captured, ctx, identity=identity, question=content,
+                request_id=request_id, started_at=started_at, source=source,
+                success=False, error="exception_group",
+            )
             # 若已经吐了部分 token，这里再追加一段错误文案；否则就是一整段错误
             yield KIND_ERROR, msgs.error
             return
-        except Exception:
+        except Exception as e:
             logger.exception("流式处理消息时出错")
+            await self._fire_usage_hook(
+                captured, ctx, identity=identity, question=content,
+                request_id=request_id, started_at=started_at, source=source,
+                success=False, error=type(e).__name__,
+            )
             yield KIND_ERROR, msgs.error
             return
+
+        await self._fire_usage_hook(
+            captured, ctx, identity=identity, question=content,
+            request_id=request_id, started_at=started_at, source=source,
+            success=True,
+        )
 
         reply = "".join(parts)
 
@@ -609,7 +704,7 @@ def run_bot(config: BotConfig) -> None:
             except Exception as e:
                 logger.debug("推送进度失败（忽略）：%s", e)
 
-        reply = await pipeline.handle(frame, on_progress=on_progress)
+        reply = await pipeline.handle(frame, on_progress=on_progress, source="wecom")
 
         try:
             await ws_client.reply_stream(frame, stream_id, reply.text, True)

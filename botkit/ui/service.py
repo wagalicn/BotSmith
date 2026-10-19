@@ -1315,7 +1315,9 @@ async def preview_chat(
             )
 
         try:
-            result = await pipeline.handle(frame, on_tool_call=on_tool_call)
+            result = await pipeline.handle(
+                frame, on_tool_call=on_tool_call, source="preview"
+            )
             reply = result.text
             # 身份不符 pattern：pipeline 会返回 identity_invalid 文案而不抛异常。
             # 预览里把它翻成可操作的提示（和之前 engine.chat 抛 IdentityRejected 时一致）。

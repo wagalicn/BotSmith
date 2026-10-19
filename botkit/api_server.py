@@ -153,7 +153,7 @@ async def _handle_chat(request: web.Request) -> web.Response:
             return await _stream_chat(request, pipeline, frame, session_id)
 
         try:
-            reply = await pipeline.handle(frame)
+            reply = await pipeline.handle(frame, source="api")
         except Exception:
             logger.exception("处理 /chat 请求时出错 user=%s", user)
             return web.json_response(
@@ -212,7 +212,9 @@ async def _stream_chat(
 
     last_kind = "llm"
     try:
-        async for kind, piece in pipeline.handle_stream(frame, on_progress=on_progress):
+        async for kind, piece in pipeline.handle_stream(
+            frame, on_progress=on_progress, source="api"
+        ):
             last_kind = kind
             await resp.write(_sse_event({"delta": piece}))
     except Exception:

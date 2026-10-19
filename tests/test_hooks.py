@@ -88,7 +88,7 @@ async def test_only_declared_hooks_are_overridden(hooks_file):
     assert await hooks.after_tool_call("t", "结果", ctx()) == "结果"
 
 
-async def test_all_five_hooks_can_be_implemented(hooks_file):
+async def test_all_hooks_can_be_implemented(hooks_file):
     hooks = load_hooks(
         hooks_file(
             """
@@ -106,6 +106,9 @@ async def test_all_five_hooks_can_be_implemented(hooks_file):
 
             def before_reply(text, ctx):
                 return text
+
+            def on_usage(stats, ctx):
+                return None
             """
         )
     )
@@ -623,3 +626,47 @@ def test_register_routes_loaded_from_file_with_base_path(hooks_file):
     fake_app: dict = {}
     hooks.register_routes(app=fake_app, config=None, pipeline=None, base_path="/demand")
     assert fake_app["routes"] == ["/demand/analyze"]
+
+
+# --------------------------------------------------------------------------
+# on_usage hook（一轮用量观测）
+# --------------------------------------------------------------------------
+
+
+async def test_on_usage_hook_called_with_stats():
+    from botkit.hooks import TurnStats
+
+    seen = {}
+
+    async def on_usage(stats, ctx):
+        seen["stats"] = stats
+
+    hooks = Hooks({"on_usage": on_usage})
+    stats = TurnStats(input_tokens=100, output_tokens=20, model="m", tool_calls=2)
+    await hooks.on_usage(stats, ctx())
+
+    assert seen["stats"].total_tokens == 120
+    assert seen["stats"].tool_calls == 2
+
+
+async def test_on_usage_missing_is_noop():
+    """没实现 on_usage 时静默跳过，不报错"""
+    await Hooks().on_usage(None, ctx())  # 不抛
+
+
+async def test_on_usage_error_is_swallowed(caplog):
+    """on_usage 出错绝不能影响主流程，只记日志"""
+
+    async def on_usage(stats, ctx):
+        raise RuntimeError("上报炸了")
+
+    hooks = Hooks({"on_usage": on_usage})
+    with caplog.at_level(logging.ERROR, logger="botkit.hooks"):
+        await hooks.on_usage(None, ctx())  # 不抛
+    assert any("on_usage" in r.getMessage() for r in caplog.records)
+
+
+def test_turn_stats_total_tokens():
+    from botkit.hooks import TurnStats
+
+    assert TurnStats(input_tokens=7, output_tokens=3).total_tokens == 10

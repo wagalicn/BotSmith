@@ -29,6 +29,9 @@ logger = logging.getLogger("botkit.engine")
 ProgressCallback = Callable[[str], Awaitable[None]]
 # (工具名, 实际发出的参数, 工具返回的文本)
 ToolCallObserver = Callable[[str, "dict[str, Any]", str], Awaitable[None]]
+# 一轮对话收尾时回调：(本轮累计 token 用量, 工具调用总次数)。
+# engine 只把它掌握的这两样交出去，其余（耗时/问题/成败）由 pipeline 补全。
+UsageReporter = Callable[["TokenUsage", int], Awaitable[None]]
 
 
 class IdentityRejected(Exception):
@@ -104,6 +107,7 @@ class BotEngine:
         on_progress: ProgressCallback | None = None,
         hook_context: HookContext | None = None,
         on_tool_call: ToolCallObserver | None = None,
+        on_usage: "UsageReporter | None" = None,
     ) -> str:
         """
         处理一次用户消息，返回最终回复文本。
@@ -139,6 +143,7 @@ class BotEngine:
         # 一轮对话里 function calling 可能调多次 LLM，token 要跨轮累加
         total_usage = TokenUsage()
         llm_calls = 0
+        tool_calls_total = 0
 
         async with self.mcp.session(identity=identity) as sess:
             tools = await sess.list_tools_openai()
@@ -156,16 +161,18 @@ class BotEngine:
                         raise LlmError("LLM 返回了空回复")
                     logger.info("第 %d 轮得到最终回复（%d 字）", round_i, len(reply))
                     _log_usage(total_usage, llm_calls)
+                    await _report_usage(on_usage, total_usage, tool_calls_total)
                     return reply
 
                 # 有工具调用：身份注入、hook 改写、调用并回灌结果
-                await self._execute_tool_calls(
+                tool_calls_total += await self._execute_tool_calls(
                     sess, resp, messages, identity, ctx, on_progress, on_tool_call
                 )
 
         # 轮次用完还没给出文本回复，通常是模型在反复调工具打转
         logger.warning("工具调用轮次达到上限 %d，放弃本轮", max_rounds)
         _log_usage(total_usage, llm_calls)
+        await _report_usage(on_usage, total_usage, tool_calls_total)
         return self.config.messages.tool_rounds_exceeded
 
     async def chat_stream(
@@ -176,6 +183,7 @@ class BotEngine:
         on_progress: ProgressCallback | None = None,
         hook_context: HookContext | None = None,
         on_tool_call: ToolCallObserver | None = None,
+        on_usage: "UsageReporter | None" = None,
     ) -> AsyncIterator[str]:
         """
         chat 的流式版本：逐段 yield 最终回复的文本增量（打字机效果）。
@@ -207,6 +215,7 @@ class BotEngine:
         max_rounds = self.config.llm.max_tool_rounds
         total_usage = TokenUsage()
         llm_calls = 0
+        tool_calls_total = 0
 
         async with self.mcp.session(identity=identity) as sess:
             tools = await sess.list_tools_openai()
@@ -237,15 +246,17 @@ class BotEngine:
                         raise LlmError("LLM 返回了空回复")
                     logger.info("第 %d 轮得到最终回复（流式）", round_i)
                     _log_usage(total_usage, llm_calls)
+                    await _report_usage(on_usage, total_usage, tool_calls_total)
                     return
 
                 # 工具调用轮：和 chat 完全一样地处理
-                await self._execute_tool_calls(
+                tool_calls_total += await self._execute_tool_calls(
                     sess, resp, messages, identity, ctx, on_progress, on_tool_call
                 )
 
         logger.warning("工具调用轮次达到上限 %d，放弃本轮", max_rounds)
         _log_usage(total_usage, llm_calls)
+        await _report_usage(on_usage, total_usage, tool_calls_total)
         yield self.config.messages.tool_rounds_exceeded
 
     async def _execute_tool_calls(
@@ -263,6 +274,8 @@ class BotEngine:
         强制注入、hook 改写、参数同步，调用工具并把结果回灌进 messages。
 
         chat 和 chat_stream 共用这段逻辑，确保两条路径行为完全一致。
+
+        返回本轮处理的工具调用数，供上层累加进用量统计。
         """
         assistant_message = resp.message
         messages.append(assistant_message)
@@ -306,8 +319,19 @@ class BotEngine:
                 }
             )
 
+        return len(resp.tool_calls)
+
     async def aclose(self) -> None:
         await self.backend.aclose()
+
+
+async def _report_usage(
+    on_usage: "UsageReporter | None", usage: TokenUsage, tool_calls: int
+) -> None:
+    """把本轮用量交给上层回调（pipeline 会据此触发 on_usage hook）。不传则无操作。"""
+    if on_usage is None:
+        return
+    await on_usage(usage, tool_calls)
 
 
 def _log_usage(usage: TokenUsage, llm_calls: int) -> None:
