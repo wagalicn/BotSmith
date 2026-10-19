@@ -202,6 +202,18 @@
         <p class="hint" data-i18n="preview.input_hint">按 Enter 发送，Shift+Enter 换行。预览的对话不会保存。</p>
       </section>
 
+      <!-- 用量 -->
+      <section class="panel panel-wide" data-panel="usage" hidden>
+        <h2 data-i18n="usage.h2">用量统计</h2>
+        <p class="desc" data-i18n="usage.desc"></p>
+        <div class="row">
+          <label class="field-label" for="usage-month" style="margin:0" data-i18n="usage.month_label">月份</label>
+          <select id="usage-month" class="narrow"></select>
+        </div>
+        <div id="usage-cards" class="usage-cards"></div>
+        <div id="usage-detail"></div>
+      </section>
+
       <!-- 高级 -->
       <section class="panel" data-panel="advanced" hidden>
         <h2 data-i18n="advanced.h2">其他</h2>

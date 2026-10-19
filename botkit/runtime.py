@@ -27,6 +27,7 @@ from botkit.llm import create_backend
 from botkit.logging_setup import setup_logging
 from botkit.mcp_client import McpToolClient
 from botkit.session import SessionStore
+from botkit.usage import UsageStore
 
 logger = logging.getLogger("botkit.runtime")
 
@@ -81,11 +82,15 @@ class MessagePipeline:
         engine: BotEngine,
         sessions: SessionStore,
         hooks: Hooks | None = None,
+        usage_store: UsageStore | None = None,
     ):
         self.config = config
         self.engine = engine
         self.sessions = sessions
         self.hooks = hooks or Hooks()
+        # 用量落盘：默认按 bot 目录建 JSONL store（无条件内置）。
+        # 传 None 走默认；测试里可注入别的实现或假时钟。
+        self.usage_store = usage_store or UsageStore.from_config(config.bot_dir)
 
     # -- 身份 --------------------------------------------------------------
 
@@ -221,8 +226,11 @@ class MessagePipeline:
         组装 TurnStats 并触发 on_usage hook。
 
         captured 是 engine 回调塞进来的 {usage, tool_calls}；没进 LLM（前置拦截）
-        或 engine 没回调时 captured 为空，这轮没有真实消耗，就不触发 hook。
-        hook 内部出错由 Hooks.on_usage 吞掉，不影响已给用户的回复。
+        或 engine 没回调时 captured 为空，这轮没有真实消耗，就不记录也不触发 hook。
+
+        组装好 TurnStats 后：先落盘（骨架保底，本地留痕），再触发 on_usage hook
+        （外部上报，业务侧自理）。两者独立——写盘失败由 UsageStore 吞掉，hook 出错
+        由 Hooks.on_usage 吞掉，互不影响，也都不影响已给用户的回复。
         """
         if "usage" not in captured:
             return
@@ -241,6 +249,8 @@ class MessagePipeline:
             agent_name=self.config.name,
             request_id=request_id,
         )
+        # 先写盘（保底），再触发外部上报 hook。顺序固定：本地账优先。
+        self.usage_store.record(stats)
         await self.hooks.on_usage(stats, ctx)
 
     async def handle(
@@ -480,7 +490,8 @@ def build_pipeline(config: BotConfig) -> tuple[MessagePipeline, BotEngine]:
     backend = create_backend(config.llm)
     engine = BotEngine(config, mcp, backend, hooks=hooks)
     sessions = SessionStore.from_config(config.session)
-    return MessagePipeline(config, engine, sessions, hooks), engine
+    usage_store = UsageStore.from_config(config.bot_dir)
+    return MessagePipeline(config, engine, sessions, hooks, usage_store), engine
 
 
 async def _start_chat_api(

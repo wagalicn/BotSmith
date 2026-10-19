@@ -560,3 +560,56 @@ async def test_preview_stream_route_precheck_error_is_json(project, monkeypatch)
         assert resp.status == 400
         body = await resp.json()
         assert "配置还没通过校验" in body["error"]
+
+
+# --------------------------------------------------------------------------
+# 用量接口 GET /api/bots/{name}/usage
+# --------------------------------------------------------------------------
+
+
+async def test_usage_endpoint_empty(client, ready_bot):
+    resp = await client.get("/api/bots/hr-bot/usage")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["name"] == "hr-bot"
+    assert data["months"] == []
+    assert data["current"] is None
+    assert data["summary"]["turns"] == 0
+
+
+async def test_usage_endpoint_reads_data(client, ready_bot):
+    import json
+
+    usage = ready_bot / "usage"
+    usage.mkdir()
+    rows = [
+        {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+         "success": True, "question": "hi"},
+    ]
+    (usage / "usage-202610.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+
+    resp = await client.get("/api/bots/hr-bot/usage")
+    data = await resp.json()
+    assert data["current"] == "202610"
+    assert data["summary"]["total_tokens"] == 120
+    assert len(data["detail"]) == 1
+
+
+async def test_usage_endpoint_month_param(client, ready_bot):
+    import json
+
+    usage = ready_bot / "usage"
+    usage.mkdir()
+    for tag, tok in (("202609", 10), ("202610", 999)):
+        (usage / f"usage-{tag}.jsonl").write_text(
+            json.dumps({"input_tokens": tok, "output_tokens": 0,
+                        "total_tokens": tok, "success": True}) + "\n",
+            encoding="utf-8",
+        )
+
+    resp = await client.get("/api/bots/hr-bot/usage?month=202609")
+    data = await resp.json()
+    assert data["current"] == "202609"
+    assert data["summary"]["total_tokens"] == 10

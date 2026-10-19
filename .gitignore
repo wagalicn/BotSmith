@@ -27,5 +27,11 @@ _tmp*
 # 忽略 bots 目录下的所有Agent配置，但保留目录结构
 bots/*
 !bots/.gitkeep
+
+# 用量落盘目录（含用户标识），任何 Agent 的都不进 git。
+# bots/* 已整体忽略，这条是显式兜底：即便将来把某个示例 Agent 纳入版本管理，
+# 它的 usage/ 仍被排除。
+usage/
+**/usage/*.jsonl
 demandDoc/
 .vscode

@@ -36,6 +36,21 @@ from test_engine import ScriptedBackend, make_config, make_engine
 # --------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _usage_to_tmp(tmp_path, monkeypatch):
+    """
+    用量落盘默认写 config.bot_dir（测试里是 Path(".")，即工作区根）。
+    把它重定向到临时目录，避免测试在仓库里留下 usage/ 文件。
+    """
+    from botkit import usage as usage_mod
+
+    monkeypatch.setattr(
+        usage_mod.UsageStore,
+        "from_config",
+        classmethod(lambda cls, bot_dir: usage_mod.JsonlUsageStore(tmp_path)),
+    )
+
+
 def frame(
     content: str,
     userid: str = "L220104",
@@ -1020,3 +1035,87 @@ async def test_pipeline_no_usage_hook_on_front_intercept():
 
     await pipeline.handle(frame(""))        # 空消息，前置拦截
     assert called["n"] == 0
+
+
+# --------------------------------------------------------------------------
+# 用量落盘：pipeline 先写盘（保底）再触发 on_usage（外部上报）
+# --------------------------------------------------------------------------
+
+
+class RecordingUsageStore:
+    """假用量存储：记录 record 的调用，供断言落盘内容与时序"""
+
+    def __init__(self, order):
+        self.recorded = []
+        self._order = order
+
+    def record(self, stats):
+        self._order.append("store")
+        self.recorded.append(stats)
+
+    def list_months(self):
+        return []
+
+    def read_month(self, month):
+        return []
+
+
+async def test_pipeline_records_to_store_then_hook():
+    """每轮进 LLM 后应落盘一次，且落盘发生在 on_usage hook 之前"""
+    from botkit.hooks import Hooks
+
+    order: list[str] = []
+
+    async def on_usage(stats, ctx):
+        order.append("hook")
+
+    cfg = make_config()
+    cfg.name = "demo-agent"
+    cfg.identity = IdentityConfig(pattern=None)
+    eng = UsageEngine(usage=(100, 20), tool_calls=2, config=cfg)
+    sessions = SessionStore.from_config(cfg.session)
+    store = RecordingUsageStore(order)
+    pipeline = MessagePipeline(
+        cfg, eng, sessions, Hooks({"on_usage": on_usage}), usage_store=store
+    )
+
+    await pipeline.handle(frame("查一下"), source="wecom")
+
+    # 落盘发生了一次，内容是本轮的 TurnStats
+    assert len(store.recorded) == 1
+    s = store.recorded[0]
+    assert s.input_tokens == 100
+    assert s.output_tokens == 20
+    assert s.agent_name == "demo-agent"
+    assert s.source == "wecom"
+    # 时序：先写盘，后触发 hook
+    assert order == ["store", "hook"]
+
+
+async def test_pipeline_records_even_without_usage_hook():
+    """没实现 on_usage hook 时，仍然要落盘（落盘是骨架无条件内置的）"""
+    cfg = make_config()
+    cfg.identity = IdentityConfig(pattern=None)
+    eng = UsageEngine(usage=(50, 10), config=cfg)
+    sessions = SessionStore.from_config(cfg.session)
+    store = RecordingUsageStore([])
+    pipeline = MessagePipeline(cfg, eng, sessions, Hooks(), usage_store=store)
+
+    await pipeline.handle(frame("在吗"))
+
+    assert len(store.recorded) == 1
+    assert store.recorded[0].total_tokens == 60
+
+
+async def test_pipeline_no_record_on_front_intercept():
+    """前置拦截（空消息）没进 LLM，不该落盘"""
+    cfg = make_config()
+    cfg.identity = IdentityConfig(pattern=None)
+    eng = UsageEngine(config=cfg)
+    sessions = SessionStore.from_config(cfg.session)
+    store = RecordingUsageStore([])
+    pipeline = MessagePipeline(cfg, eng, sessions, Hooks(), usage_store=store)
+
+    await pipeline.handle(frame(""))
+
+    assert store.recorded == []
