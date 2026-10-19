@@ -4,7 +4,7 @@
 大部分Agent不需要写这里的任何代码 —— bot.yaml + prompt.md 就够了。
 下面全部注释掉，需要哪个就取消注释。
 
-框架只认这 5 个函数名，同步和 async def 都支持，没定义的走框架默认行为。
+框架只认下面这几个函数名，同步和 async def 都支持，没定义的走框架默认行为。
 hook 抛异常时框架会记日志并降级到默认行为，不会让整条消息挂掉，
 所以不用在里面写一堆 try/except。
 
@@ -78,3 +78,34 @@ ctx 上可以拿到：
 #     什么时候需要：统一署名、追加帮助入口、格式化。
 #     """
 #     return text + "\n\n—— {{BOT_NAME}}"
+
+
+# def on_usage(stats, ctx):
+#     """
+#     一轮对话结束后的用量观测点（纯观测，无返回值）。stats 是 TurnStats：
+#       stats.input_tokens / output_tokens / total_tokens  本轮累计 token
+#       stats.model          本轮用的模型
+#       stats.tool_calls     工具调用次数
+#       stats.elapsed_ms     本轮耗时（毫秒）
+#       stats.identity       用户标识
+#       stats.question       用户提问
+#       stats.source         来源（wecom / api / preview）
+#       stats.success/error  成败
+#       stats.agent_name     Agent 名（= config.name）
+#       stats.request_id     本轮唯一 ID
+#
+#     什么时候需要：把用量上报到自建的统计/计费系统。报不报、报去哪由你决定，
+#     骨架不内置任何上报目标。出错只记日志、不影响已给用户的回复。
+#     端点不返回用量时（token 全 0）骨架不会触发本 hook。
+#     """
+#     # 示例：POST 到某个用量中台（地址/密钥走 .env，不要写死）
+#     # import os, httpx2
+#     # url = os.environ.get("USAGE_REPORT_URL")
+#     # if not url:
+#     #     return
+#     # async with httpx2.AsyncClient(timeout=3.0) as c:
+#     #     await c.post(url, json={
+#     #         "agent": stats.agent_name, "model": stats.model,
+#     #         "prompt_tokens": stats.input_tokens,
+#     #         "completion_tokens": stats.output_tokens,
+#     #     })

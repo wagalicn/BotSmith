@@ -9,6 +9,7 @@
     before_tool_call(tool_name, args, ctx) -> dict       工具参数改写
     after_tool_call(tool_name, result, ctx) -> str       工具结果加工
     before_reply(text, ctx)             -> str           最终回复加工
+    on_usage(stats, ctx)                -> None          一轮结束的用量观测（上报等）
 
 另有一个不同类的扩展点，用于给对外 HTTP 服务挂 bot 特有的自定义路由：
 
@@ -46,6 +47,7 @@ HOOK_NAMES = (
     "before_tool_call",
     "after_tool_call",
     "before_reply",
+    "on_usage",
 )
 
 # register_routes 是另一类扩展点：不是消息处理 hook，而是让 bot 往对外
@@ -87,6 +89,47 @@ class HookContext:
     config: Any = None
     logger: logging.Logger = logger
     frame: dict[str, Any] | None = None
+
+
+@dataclass
+class TurnStats:
+    """
+    一轮对话的统计数据，传给 on_usage hook。
+
+    骨架只负责把这些算准、交出来；要不要上报、报到哪（如某个用量中台），
+    由 bot 在 on_usage 里自己决定——骨架不内置任何上报目标。
+
+    字段对应常见用量看板需要的维度（token、耗时、工具次数、成败、渠道），
+    命名尽量贴近通用语义，不绑定任何具体平台的协议。
+    """
+
+    # token 用量（input/output/total）。端点没返回时 input/output 都是 0。
+    input_tokens: int = 0
+    output_tokens: int = 0
+    # 本轮用的模型名（config.llm.model）
+    model: str = ""
+    # 本轮触发的工具调用次数
+    tool_calls: int = 0
+    # 本轮耗时（毫秒，含 LLM + 工具）
+    elapsed_ms: int = 0
+    # 用户标识（解析后的身份）
+    identity: str | None = None
+    # 用户原始提问（截断由上报方自理）
+    question: str = ""
+    # 来源渠道：wecom / api（对外 /chat）/ preview 等，便于区分接入方式
+    source: str = ""
+    # 本轮是否成功产出回复
+    success: bool = True
+    # 失败原因（success=False 时）
+    error: str = ""
+    # Agent 标识（config.name），多 Agent 上报时区分来源
+    agent_name: str = ""
+    # 本轮唯一 ID，骨架生成；上报时可用来和工具调用日志关联
+    request_id: str = ""
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
 
 
 async def _maybe_await(func: Callable[..., Any], *args: Any) -> Any:
@@ -249,6 +292,21 @@ class Hooks:
             )
             return text
         return out
+
+    async def on_usage(self, stats: "TurnStats", ctx: HookContext) -> None:
+        """
+        一轮对话结束后的用量观测点。没返回值——纯观测/上报用。
+
+        bot 在这里拿到本轮的 token/耗时/工具次数等（TurnStats），自己决定要不要
+        上报、报到哪。出错只记日志、绝不影响已经给用户的回复（上报失败不能拖垮对话）。
+        """
+        fn = self._impls.get("on_usage")
+        if fn is None:
+            return
+        try:
+            await _maybe_await(fn, stats, ctx)
+        except Exception:
+            logger.exception("hook on_usage 出错（已忽略，不影响本轮回复）")
 
 
 def load_hooks(path: Path | None) -> Hooks:

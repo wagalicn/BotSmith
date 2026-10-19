@@ -69,6 +69,7 @@ class RecordingEngine:
         on_progress=None,
         hook_context=None,
         on_tool_call=None,
+        on_usage=None,
     ):
         self.calls.append(
             {
@@ -83,6 +84,10 @@ class RecordingEngine:
             await on_progress("引擎的进度提示")
         if self._raises:
             raise self._raises
+        if on_usage:
+            from botkit.llm.base import TokenUsage
+
+            await on_usage(TokenUsage(), 0)
         return self._reply
 
     async def chat_stream(
@@ -93,6 +98,7 @@ class RecordingEngine:
         on_progress=None,
         hook_context=None,
         on_tool_call=None,
+        on_usage=None,
     ):
         self.calls.append(
             {
@@ -111,6 +117,10 @@ class RecordingEngine:
         # 逐字吐，模拟流式
         for ch in self._reply:
             yield ch
+        if on_usage:
+            from botkit.llm.base import TokenUsage
+
+            await on_usage(TokenUsage(), 0)
 
     async def aclose(self):
         pass
@@ -933,3 +943,80 @@ async def test_handle_stream_reply_suffix_appended():
     assert full == "正文\n—— 署名"
     # 存历史也带后缀
     assert sessions.get_history(sessions.key_for(f))[-1]["content"] == "正文\n—— 署名"
+
+
+# --------------------------------------------------------------------------
+# on_usage：pipeline 组装 TurnStats 并触发 hook
+# --------------------------------------------------------------------------
+
+
+class UsageEngine:
+    """假引擎：chat 时通过 on_usage 回调交出预设用量"""
+
+    def __init__(self, reply="回复", usage=(100, 20), tool_calls=1, config=None):
+        self._reply = reply
+        self._usage = usage
+        self._tool_calls = tool_calls
+        self.config = config or make_config()
+
+    async def chat(self, user_message, identity, history=None, on_progress=None,
+                   hook_context=None, on_tool_call=None, on_usage=None):
+        if on_usage:
+            from botkit.llm.base import TokenUsage
+
+            await on_usage(TokenUsage(*self._usage), self._tool_calls)
+        return self._reply
+
+    async def aclose(self):
+        pass
+
+
+async def test_pipeline_fires_on_usage_with_stats():
+    from botkit.hooks import Hooks
+
+    seen = {}
+
+    async def on_usage(stats, ctx):
+        seen["stats"] = stats
+
+    cfg = make_config()
+    cfg.name = "demo-agent"
+    cfg.identity = IdentityConfig(pattern=None)
+    eng = UsageEngine(usage=(100, 20), tool_calls=2, config=cfg)
+    sessions = SessionStore.from_config(cfg.session)
+    pipeline = MessagePipeline(cfg, eng, sessions, Hooks({"on_usage": on_usage}))
+
+    await pipeline.handle(frame("查一下"), source="wecom")
+
+    s = seen["stats"]
+    assert s.input_tokens == 100
+    assert s.output_tokens == 20
+    assert s.total_tokens == 120
+    assert s.tool_calls == 2
+    assert s.model == cfg.llm.model
+    assert s.agent_name == "demo-agent"
+    assert s.source == "wecom"
+    assert s.success is True
+    assert s.identity == "L220104"
+    assert s.question == "查一下"
+    assert s.request_id  # 非空
+    assert s.elapsed_ms >= 0
+
+
+async def test_pipeline_no_usage_hook_on_front_intercept():
+    """前置拦截（空消息等）没进 LLM，不该触发 on_usage"""
+    from botkit.hooks import Hooks
+
+    called = {"n": 0}
+
+    async def on_usage(stats, ctx):
+        called["n"] += 1
+
+    cfg = make_config()
+    cfg.identity = IdentityConfig(pattern=None)
+    eng = UsageEngine(config=cfg)
+    sessions = SessionStore.from_config(cfg.session)
+    pipeline = MessagePipeline(cfg, eng, sessions, Hooks({"on_usage": on_usage}))
+
+    await pipeline.handle(frame(""))        # 空消息，前置拦截
+    assert called["n"] == 0
