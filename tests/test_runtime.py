@@ -36,21 +36,6 @@ from test_engine import ScriptedBackend, make_config, make_engine
 # --------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _usage_to_tmp(tmp_path, monkeypatch):
-    """
-    用量落盘默认写 config.bot_dir（测试里是 Path(".")，即工作区根）。
-    把它重定向到临时目录，避免测试在仓库里留下 usage/ 文件。
-    """
-    from botkit import usage as usage_mod
-
-    monkeypatch.setattr(
-        usage_mod.UsageStore,
-        "from_config",
-        classmethod(lambda cls, bot_dir: usage_mod.JsonlUsageStore(tmp_path)),
-    )
-
-
 def frame(
     content: str,
     userid: str = "L220104",

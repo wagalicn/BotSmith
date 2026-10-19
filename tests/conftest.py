@@ -101,3 +101,21 @@ def base_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("TEST_BOT_SECRET", "bot-secret-5678")
     monkeypatch.setenv("TEST_LLM_KEY", "sk-test-key")
     return monkeypatch
+
+
+@pytest.fixture(autouse=True)
+def _usage_to_tmp(tmp_path, monkeypatch):
+    """
+    用量落盘默认写 config.bot_dir。测试里的 BotConfig 常用 Path(".")（即仓库根），
+    真实跑一条消息就会在仓库里留下 usage/usage-YYYYMM.jsonl。
+
+    全局把 UsageStore.from_config 重定向到每个测试独立的临时目录，杜绝任何测试
+    （runtime / sse / api_server / ui 预览等走真实 pipeline 的）污染工作区。
+    """
+    from botkit import usage as usage_mod
+
+    monkeypatch.setattr(
+        usage_mod.UsageStore,
+        "from_config",
+        classmethod(lambda cls, bot_dir: usage_mod.JsonlUsageStore(tmp_path)),
+    )
