@@ -177,9 +177,8 @@ def isolated_env() -> Iterator[None]:
     """
     在环境变量的副本里做事，退出时还原。
 
-    load_bot_config 会把 bot 的 .env 灌进 os.environ 且不覆盖已有值。
-    页面上来回切 bot 时，如果不隔离，第一个 bot 的密钥会一直留着，
-    并且盖住后面 bot 的同名变量 —— 校验结果就全错了。
+    配置加载本身不再修改全局环境；这里仍保留为 UI 任务的纵深隔离，防止
+    第三方探测库或业务扩展在预览过程中改动 os.environ。
     """
     saved = dict(os.environ)
     try:
@@ -409,7 +408,7 @@ def read_bot(root: Path | str, name: str) -> dict[str, Any]:
         "prompt": prompt_text,
         "prompt_file": prompt_file or "prompt.md",
         "env": env,
-        "hooks": _hooks_state(bot_dir, raw),
+        "hooks": _hooks_state(bot_dir, raw, env_values),
         "validation": validate_bot_dir(bot_dir),
     }
 
@@ -501,8 +500,10 @@ def _server_url_var(server: dict[str, Any]) -> str | None:
     return _sole_placeholder_var(server.get("url"))
 
 
-def _hooks_state(bot_dir: Path, raw: dict[str, Any]) -> dict[str, Any]:
-    """hooks.py 的状态，只做展示用，页面不编辑代码"""
+def _hooks_state(
+    bot_dir: Path, raw: dict[str, Any], env_values: dict[str, str]
+) -> dict[str, Any]:
+    """hooks.py 的状态，只做展示用，页面不编辑代码。"""
     hooks_cfg = raw.get("hooks") if isinstance(raw.get("hooks"), dict) else {}
     rel = (hooks_cfg or {}).get("file") or "hooks.py"
     path = (bot_dir / str(rel)).resolve()
@@ -511,8 +512,13 @@ def _hooks_state(bot_dir: Path, raw: dict[str, Any]) -> dict[str, Any]:
 
     from botkit.hooks import HookError, load_hooks
 
+    # 和配置加载一致：进程显式注入优先于 bot 自己的 .env。
+    hook_env = {
+        name: os.environ.get(name, value)
+        for name, value in env_values.items()
+    }
     try:
-        hooks = load_hooks(path)
+        hooks = load_hooks(path, env_values=hook_env)
         implemented = hooks.implemented
         error = ""
     except HookError as e:
@@ -752,10 +758,10 @@ def _extract_api_env(bot_dir: Path, values: dict[str, Any]) -> dict[str, str]:
     """
     把 api.token 的明文落到 .env 的 CHAT_API_TOKEN，token 字段就地改回占位符。
 
-    token 可以为空（= 不鉴权），是合法的。
+    API 启用时 token 由 _check_values 强制非空；API 未启用时可以留空。
     - 填了明文 → 写回 .env、yaml 存占位符。
     - 留空但 .env 已有 → 保留旧值（避免误清）。
-    - 留空且 .env 也没有 → 写空值（表示不鉴权），yaml 仍存占位符。
+    - 留空且 .env 也没有 → 写空占位，供以后启用 API 时填写。
     """
     api = values.get("api")
     if not isinstance(api, dict):
@@ -797,6 +803,15 @@ def _check_values(values: dict[str, Any]) -> None:
     enum("llm", "client", VALID_LLM_CLIENTS)
     enum("session", "scope", VALID_SESSION_SCOPES)
     enum("identity", "source", VALID_IDENTITY_SOURCES)
+
+    api = values.get("api")
+    if isinstance(api, dict) and bool(api.get("enabled", False)):
+        token = str(api.get("token") or "").strip()
+        if not token:
+            raise UiError(_m(
+                "开启对外接口时必须填写鉴权 token",
+                "An authentication token is required when the external API is enabled",
+            ))
 
     log = values.get("logging")
     if isinstance(log, dict) and log.get("level"):
@@ -1217,7 +1232,7 @@ def _build_preview_engine(cfg: Any) -> Any:
     from botkit.hooks import load_hooks
     from botkit.llm import create_backend
 
-    hooks = load_hooks(cfg.hooks_file)
+    hooks = load_hooks(cfg.hooks_file, env_values=cfg.env_values)
     mcp = McpToolClient(cfg.mcp.servers)
     backend = create_backend(cfg.llm)
     return BotEngine(cfg, mcp, backend, hooks=hooks)
@@ -1614,7 +1629,7 @@ def _sample_identity(cfg: Any) -> str:
     if not pattern:
         return "probe-user"
     for candidate in ("L220104", "M220104", "probe-user"):
-        if re.match(pattern, candidate):
+        if re.fullmatch(pattern, candidate):
             return candidate
     return "probe-user"
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -147,6 +148,10 @@ def test_dotenv_file_is_loaded(bot_dir_factory, monkeypatch):
     cfg = load_bot_config(bot_dir)
     assert cfg.wecom.bot_id == "from-dotenv-id"
     assert cfg.llm.api_key == "from-dotenv-key"
+    assert cfg.env_value("TEST_BOT_ID") == "from-dotenv-id"
+    assert cfg.env_value("TEST_LLM_KEY") == "from-dotenv-key"
+    assert "TEST_BOT_ID" not in os.environ
+    assert "TEST_LLM_KEY" not in os.environ
 
 
 # --------------------------------------------------------------------------
@@ -614,3 +619,31 @@ def test_anthropic_api_url_with_messages_suffix_rejected(bot_dir_factory, base_e
     ).replace("  model: test-model", "  client: anthropic\n  model: test-model")
     with pytest.raises(ConfigError, match="messages"):
         load_bot_config(bot_dir_factory(yaml_text=yaml_text))
+
+
+# --------------------------------------------------------------------------
+# 对外 API 安全默认值
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("token_line", ["", "  token: ''", "  token: '   '"])
+def test_api_enabled_requires_non_empty_token(bot_dir_factory, base_env, token_line):
+    yaml_text = MINIMAL_YAML + "\napi:\n  enabled: true\n" + (
+        token_line + "\n" if token_line else ""
+    )
+    with pytest.raises(ConfigError, match=r"api\.token"):
+        load_bot_config(bot_dir_factory(yaml_text=yaml_text))
+
+
+def test_api_enabled_accepts_non_empty_token(bot_dir_factory, base_env):
+    yaml_text = MINIMAL_YAML + "\napi:\n  enabled: true\n  token: test-secret\n"
+    cfg = load_bot_config(bot_dir_factory(yaml_text=yaml_text))
+    assert cfg.api.enabled is True
+    assert cfg.api.token == "test-secret"
+
+
+def test_api_disabled_allows_empty_token(bot_dir_factory, base_env):
+    yaml_text = MINIMAL_YAML + "\napi:\n  enabled: false\n  token: ''\n"
+    cfg = load_bot_config(bot_dir_factory(yaml_text=yaml_text))
+    assert cfg.api.enabled is False
+    assert cfg.api.token == ""

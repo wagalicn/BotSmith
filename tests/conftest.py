@@ -49,6 +49,7 @@ MANAGED_ENV_VARS = (
     "LLM_API_URL",
     "LLM_API_KEY",
     "LLM_MODEL",
+    "CHAT_API_TOKEN",
     "MCP_URL",
     "CRM_MCP_URL",
     "TEST_BOT_ID",

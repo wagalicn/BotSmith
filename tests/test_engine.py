@@ -186,10 +186,23 @@ class ProgressRecorder:
         ("", False),
         (None, False),
         ("L220104 ", False),
+        ("L220104\n", False),
+        ("L220104\r\n", False),
+        ("L220104-evil", False),
     ],
 )
 def test_identity_matches(identity, expected):
     assert identity_matches(identity, r"^[LM]\d{6}$") is expected
+
+
+def test_identity_pattern_is_always_a_full_match():
+    assert identity_matches("L220104", r"[LM]\d{6}") is True
+    assert identity_matches("L220104-evil", r"[LM]\d{6}") is False
+
+
+def test_identity_length_is_bounded_even_without_pattern():
+    assert identity_matches("x" * 256, None) is True
+    assert identity_matches("x" * 257, None) is False
 
 
 def test_no_pattern_means_no_validation():
@@ -679,7 +692,7 @@ async def test_before_tool_call_hook_can_rewrite_args():
 
 
 async def test_before_tool_call_runs_after_identity_inject():
-    """hook 能看到已经注入的身份，也能覆盖它（hook 是最后一道）"""
+    """hook 能看到已经注入的身份。"""
     captured = {}
 
     def before_tool_call(tool_name, args, ctx):
@@ -700,6 +713,29 @@ async def test_before_tool_call_runs_after_identity_inject():
     assert captured["work_code_seen"] == "L220104"
 
 
+async def test_before_tool_call_cannot_override_injected_identity():
+    def before_tool_call(tool_name, args, ctx):
+        args["work_code"] = "L999999"
+        return args
+
+    backend = ScriptedBackend(
+        [
+            (None, [tool_call("create_it_ticket", {"title": "t"})]),
+            ("好了", []),
+        ]
+    )
+    engine, _ = make_engine(
+        backend, hooks=Hooks({"before_tool_call": before_tool_call})
+    )
+    await engine.chat("报故障", identity="L220104")
+
+    tool_msg = backend.calls[1][0][-1]
+    assert "提交人=L220104" in tool_msg["content"]
+    assert "L999999" not in tool_msg["content"]
+    assistant_call = backend.calls[1][0][-2]["tool_calls"][0]
+    assert json.loads(assistant_call["function"]["arguments"])["work_code"] == "L220104"
+
+
 async def test_after_tool_call_hook_can_rewrite_result():
     def after_tool_call(tool_name, result, ctx):
         return "结果被 hook 替换了"
@@ -717,8 +753,9 @@ async def test_after_tool_call_hook_can_rewrite_result():
     assert tool_msg["content"] == "结果被 hook 替换了"
 
 
-async def test_failing_hook_degrades_to_default():
+async def test_failing_before_tool_call_is_fail_closed():
     def before_tool_call(tool_name, args, ctx):
+        args["title"] = "不应泄漏的半成品"
         raise RuntimeError("hook 写崩了")
 
     backend = ScriptedBackend(
@@ -732,10 +769,52 @@ async def test_failing_hook_degrades_to_default():
     )
     reply = await engine.chat("报故障", identity="L220104")
 
-    # hook 崩了不影响主流程，参数用未改写的原值
     assert reply == "好了"
     tool_msg = backend.calls[1][0][-1]
-    assert "原标题" in tool_msg["content"]
+    assert "调用已拒绝" in tool_msg["content"]
+    assert "工具未执行" in tool_msg["content"]
+    assert "T001" not in tool_msg["content"]
+    assistant_call = backend.calls[1][0][-2]["tool_calls"][0]
+    sent_args = json.loads(assistant_call["function"]["arguments"])
+    assert sent_args["title"] == "原标题"
+    assert sent_args["work_code"] == "L220104"
+    assert "不应泄漏的半成品" not in json.dumps(sent_args, ensure_ascii=False)
+
+
+async def test_oversized_tool_arguments_are_rejected_before_mcp():
+    backend = ScriptedBackend(
+        [
+            (None, [tool_call("create_it_ticket", {"title": "x" * 70_000})]),
+            ("好了", []),
+        ]
+    )
+    engine, _ = make_engine(backend)
+    await engine.chat("报故障", identity="L220104")
+
+    tool_msg = backend.calls[1][0][-1]
+    assert "超过 65536 字节上限" in tool_msg["content"]
+    assert "工具未执行" in tool_msg["content"]
+
+
+async def test_non_json_hook_arguments_are_rejected_before_mcp():
+    def before_tool_call(tool_name, args, ctx):
+        args["bad"] = object()
+        return args
+
+    backend = ScriptedBackend(
+        [
+            (None, [tool_call("create_it_ticket", {"title": "t"})]),
+            ("好了", []),
+        ]
+    )
+    engine, _ = make_engine(
+        backend, hooks=Hooks({"before_tool_call": before_tool_call})
+    )
+    await engine.chat("报故障", identity="L220104")
+
+    tool_msg = backend.calls[1][0][-1]
+    assert "不是合法的 JSON 对象" in tool_msg["content"]
+    assert "工具未执行" in tool_msg["content"]
 
 
 async def test_hook_context_is_passed_through():

@@ -98,9 +98,9 @@ ctx 上可以拿到：
 #     骨架不内置任何上报目标。出错只记日志、不影响已给用户的回复。
 #     端点不返回用量时（token 全 0）骨架不会触发本 hook。
 #     """
-#     # 示例：POST 到某个用量中台（地址/密钥走 .env，不要写死）
-#     # import os, httpx2
-#     # url = os.environ.get("USAGE_REPORT_URL")
+#     # 示例：POST 到某个用量中台（地址/密钥走当前 Agent 的 .env，不要写死）
+#     # import httpx2
+#     # url = ctx.config.env_value("USAGE_REPORT_URL")
 #     # if not url:
 #     #     return
 #     # async with httpx2.AsyncClient(timeout=3.0) as c:

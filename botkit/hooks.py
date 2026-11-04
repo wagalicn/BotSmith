@@ -24,8 +24,9 @@
 约定：
 - 没定义的函数走框架默认行为，不需要写空实现
 - 同步和 async def 都支持
-- hook 抛异常时记日志并降级到默认行为，不让整条消息挂掉
-  （扩展点出问题不应该让Agent变哑巴）
+- 一般 hook 抛异常时记日志并降级到默认行为，不让整条消息挂掉
+- `before_tool_call` 是工具执行前的安全边界：异常或返回错误类型时必须
+  fail-closed，拒绝该次工具调用，不能回退到未经检查的参数
 """
 
 from __future__ import annotations
@@ -33,10 +34,12 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Mapping
 
 logger = logging.getLogger("botkit.hooks")
 
@@ -78,6 +81,14 @@ def _accepts_base_path(func: Callable[..., Any]) -> bool:
 
 class HookError(Exception):
     """hooks.py 加载失败（语法错误、import 不到依赖等）"""
+
+
+class BeforeToolCallRejected(Exception):
+    """before_tool_call 未能安全地产出参数，本次工具调用必须被拒绝。"""
+
+    def __init__(self, tool_name: str):
+        self.tool_name = tool_name
+        super().__init__(f"before_tool_call 未能安全处理工具 {tool_name}")
 
 
 @dataclass
@@ -238,21 +249,22 @@ class Hooks:
     async def before_tool_call(
         self, tool_name: str, args: dict[str, Any], ctx: HookContext
     ) -> dict[str, Any]:
-        """工具参数改写。出错或返回值不是 dict 时用原参数"""
+        """工具参数改写。异常或返回值不是 dict 时拒绝本次工具调用。"""
         fn = self._impls.get("before_tool_call")
         if fn is None:
             return args
         try:
             result = await _maybe_await(fn, tool_name, args, ctx)
-        except Exception:
-            logger.exception("hook before_tool_call 出错，使用未改写的原参数")
-            return args
+        except Exception as e:
+            logger.exception("hook before_tool_call 出错，拒绝调用工具 %s", tool_name)
+            raise BeforeToolCallRejected(tool_name) from e
         if not isinstance(result, dict):
             logger.error(
-                "hook before_tool_call 应该返回 dict，实际返回 %s，使用原参数",
+                "hook before_tool_call 应该返回 dict，实际返回 %s，拒绝调用工具 %s",
                 type(result).__name__,
+                tool_name,
             )
-            return args
+            raise BeforeToolCallRejected(tool_name)
         return result
 
     async def after_tool_call(
@@ -309,9 +321,40 @@ class Hooks:
             logger.exception("hook on_usage 出错（已忽略，不影响本轮回复）")
 
 
-def load_hooks(path: Path | None) -> Hooks:
+@contextmanager
+def _temporary_environ(values: Mapping[str, str] | None) -> Iterator[None]:
+    """
+    仅在同步导入 hooks.py 期间注入所属 Agent 的 .env 快照。
+
+    导入过程没有 await，不会和其他 Agent 的请求交错；退出后逐项恢复，避免
+    多 Agent 使用相同变量名时串值。运行时 hook 应通过 ctx.config.env_value()
+    读取所属 Agent 的值，而不是直接读取全局 os.environ。
+    """
+    if not values:
+        yield
+        return
+
+    previous = {name: os.environ.get(name) for name in values}
+    absent = {name for name in values if name not in os.environ}
+    try:
+        os.environ.update(values)
+        yield
+    finally:
+        for name in absent:
+            os.environ.pop(name, None)
+        for name, value in previous.items():
+            if name not in absent and value is not None:
+                os.environ[name] = value
+
+
+def load_hooks(
+    path: Path | None, *, env_values: Mapping[str, str] | None = None
+) -> Hooks:
     """
     从文件加载 hooks。path 为 None（没配 hook）时返回全默认的空实现。
+
+    env_values 只在模块导入期间临时可见，用于兼容在模块顶层读取 .env 的
+    现有 hook；运行时读取应使用 ctx.config.env_value()。
 
     加载失败会抛 HookError —— 文件明明存在却 import 不了，
     通常是语法错误或少装依赖，静默跳过只会让人更难查。
@@ -340,7 +383,8 @@ def load_hooks(path: Path | None) -> Hooks:
     previous = sys.dont_write_bytecode
     sys.dont_write_bytecode = True
     try:
-        spec.loader.exec_module(module)
+        with _temporary_environ(env_values):
+            spec.loader.exec_module(module)
     except Exception as e:
         del sys.modules[module_name]
         raise HookError(

@@ -95,8 +95,8 @@ def test_isolated_env_restores_on_exception(monkeypatch):
 
 def test_switching_bots_does_not_leak_secrets(project):
     """
-    这是页面上最隐蔽的一类 bug：读了 A 的 .env 之后环境里留着 A 的密钥，
-    再读 B 时因为 override=False 就把 B 的值盖住了，校验结果全错。
+    回归多 Agent/配置 UI 使用相同变量名时的密钥隔离：读取 A 后再读取 B，
+    B 必须仍使用自己的 `.env`，进程环境也不能留下任何一方的值。
     """
     for name, url in (("bot-a", "https://a.invalid/mcp"), ("bot-b", "https://b.invalid/mcp")):
         service.create_new_bot(project, name)
@@ -368,6 +368,14 @@ def test_save_returns_validation_errors(project):
 def test_save_rejects_bad_values_payload(project, bot):
     with pytest.raises(UiError, match="values"):
         service.save_bot(project, "hr-bot", {"values": "不是对象"})
+
+
+def test_save_rejects_enabled_api_without_token(project, bot):
+    data = service.read_bot(project, "hr-bot")
+    data["values"]["api"] = {"enabled": True, "port": 9000, "token": ""}
+
+    with pytest.raises(UiError, match="token"):
+        service.save_bot(project, "hr-bot", {"values": data["values"]})
 
 
 @pytest.mark.parametrize(

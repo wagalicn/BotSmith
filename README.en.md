@@ -65,16 +65,18 @@ API contract:
 
 ```
 POST http://<server IP>:<port>/chat
-Header:  Authorization: Bearer <token>     # only needed if a token is configured
+Header:  Authorization: Bearer <token>     # required
 Body:    {"message": "what the user said", "user": "L220104", "session_id": "conv-1"}
 Resp:    {"reply": "Agent reply", "kind": "llm", "session_id": "conv-1"}
 
 GET  http://<server IP>:<port>/health         # liveness check, no auth
 ```
 
-- **`user` / `session_id` are provided by the caller**: the portal/Dify passes the current user and session ID,
-  and the Agent passes them through statelessly. Consecutive requests with the same `session_id` = continuous multi-turn; without it, isolation is by `user`.
-- The API binds to `0.0.0.0` (reachable on the intranet), only chats and never reads/writes secrets, a different trade-off from the "config page" (bound to localhost only).
+- **`user` / `session_id` are provided by the caller**: the portal or Dify supplies the current user and session ID.
+  The server keeps multi-turn history in process; repeated requests with the same `session_id` continue the conversation,
+  while requests without one are isolated by `user`. The calling system must authenticate the real user before setting `user`.
+- The API binds to `0.0.0.0`. Put it behind a controlled network or TLS reverse proxy and use a high-entropy token;
+  MCP servers must still enforce end-user authorization. The config page remains local-only.
 
 See the [api section in the Configuration Reference](docs/configuration-reference.md#api--external-api) for fields and Dify integration details.
 
@@ -130,17 +132,19 @@ Built in, so you don't have to worry about it:
 
 ## External API in detail (integrating with Dify / portal / third parties)
 
-On the config page's "External API" tab, turn on the switch and fill in the port and token (or leave blank for no auth),
-or configure the `api` section directly in `bot.yaml`.
+On the config page's "External API" tab, turn on the switch and fill in the port and a non-empty token,
+or configure the `api` section directly in `bot.yaml`. Validation fails if the API is enabled without a token.
 
 - **Two ways to start**: `serve-api` (API only, no WeCom, in which case the Agent's WeCom bot_id/secret can be left blank)
   or `run` (serves the API alongside WeCom).
-- The API is stateless, only chats, never reads/writes secrets, and binds to `0.0.0.0` reachable on the intranet.
+- The caller supplies session identifiers and the server keeps conversation history in process. The API binds to `0.0.0.0`;
+  deploy it behind a controlled network or TLS reverse proxy.
 
 **Integrating with Dify**: in Dify, use a "custom tool / HTTP request" node pointing at this `/chat`,
 passing Dify's current user as `user` and the conversation_id as `session_id`.
 
-> For the follow-up portal roadmap (multiple Agents in one process, streaming, an aggregated portal page) see [TODO.md](TODO.md).
+> The multi-Agent gateway and SSE are implemented. See [TODO.md](TODO.md)
+> for the current status of the portal, Redis, and engineering work.
 
 ---
 
@@ -162,7 +166,7 @@ bot-demo/
 ├── start_ui.py               # shared startup logic for the scripts above
 ├── README.md
 ├── README.en.md              # English version
-├── TODO.md                   # follow-up portal roadmap
+├── TODO.md                   # current status and index of upcoming phases
 ├── docs/
 │   ├── 新建Bot步骤说明书.md
 │   └── 配置参考.md
