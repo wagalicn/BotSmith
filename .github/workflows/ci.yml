@@ -1,0 +1,46 @@
+name: CI
+
+# 每个 PR 和每次推送到 main 都自动跑完整测试。
+# 只提供检查结果，不拦截合并；是否合并由维护者看结果决定。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 最小权限：只读代码。整个流程不使用任何密钥。
+permissions:
+  contents: read
+
+# 同一个 PR 上有新提交时，取消还在跑的旧任务。
+# main 上的运行不取消，保证每个合并提交都有完整结果。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # 某个组合失败时不取消其它组合，一次把所有结果看全。
+      fail-fast: false
+      # 矩阵：下面 2 个系统 × 2 个 Python 版本 = 4 个独立任务，各自跑全部测试。
+      # 项目声明支持 Python 3.11+（用到了 BaseExceptionGroup），所以同时测下限和最新版。
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # requirements.txt 已包含 pytest 和 pytest-asyncio。
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt
+
+      # 测试配置（testpaths、asyncio_mode 等）在 pytest.ini 里。
+      - name: 运行测试
+        run: python -m pytest
