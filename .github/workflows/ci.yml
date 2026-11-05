@@ -44,3 +44,29 @@ jobs:
       # 测试配置（testpaths、asyncio_mode 等）在 pytest.ini 里。
       - name: 运行测试
         run: python -m pytest
+
+  # 打包检查：构建 wheel，在干净的虚拟环境里安装后做冒烟测试。
+  # 上面的 test 任务跑的是源码目录，测不出"打包时漏了文件"或"命令入口装不上"，这个任务补这块。
+  package:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 命令入口在两个系统上是不同的文件（botkit / botkit.exe），所以都要跑。
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # 用支持的最低版本。wheel 是纯 Python 的，内容与解释器版本无关。
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 构建 wheel
+        run: python -m pip wheel . --no-deps --wheel-dir dist-check
+
+      # 脚本会新建干净的虚拟环境并联网安装依赖，检查项见 tools/smoke_wheel.py 开头的说明。
+      - name: 安装 wheel 并冒烟测试
+        run: python tools/smoke_wheel.py dist-check
