@@ -170,6 +170,7 @@ bot-demo/
 │   ├── 新建Bot步骤说明书.md
 │   └── 配置参考.md
 ├── requirements.txt          # 依赖已钉版本
+├── pyproject.toml            # 打包配置：pip install . 后可直接用 botkit 命令
 ├── pytest.ini
 ├── botkit/                   # 框架，同事不需要改
 │   ├── cli.py                # ui / new / validate / run / serve-api
@@ -193,7 +194,8 @@ bot-demo/
 │   └── _skills/              # 共享技能文档（*.md），多个 Agent 可勾选引用
 ├── tools/
 │   ├── wecom_probe.py        # 探企微给的用户身份（命令行版）
-│   └── mcp_probe.py          # 探 MCP 工具列表与连通性（命令行版）
+│   ├── mcp_probe.py          # 探 MCP 工具列表与连通性（命令行版）
+│   └── smoke_wheel.py        # 打包冒烟测试：在干净环境安装 wheel 并检查能否使用
 └── tests/                    # 单测
 ```
 
@@ -242,6 +244,10 @@ python -m pytest
 几秒钟跑完，不需要网络也不烧 token：MCP 相关的用 SDK 的 in-memory
 transport（走真实协议但不联网），LLM 相关的用假后端，
 配置页面用 aiohttp 自带的测试客户端起真服务。
+
+也可以把项目装成命令行工具：在仓库目录执行 `pip install .`，之后用 `botkit ...`
+代替 `python -m botkit ...`（打包配置在 `pyproject.toml`；目前还没有发布到 PyPI，
+只能从源码目录安装）。`bots/`、`.env` 等 Agent 配置仍放在你运行命令的目录里，不会随包安装。
 
 技术前提：
 

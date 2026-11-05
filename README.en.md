@@ -171,6 +171,7 @@ bot-demo/
 │   ├── 新建Bot步骤说明书.md
 │   └── 配置参考.md
 ├── requirements.txt          # dependencies pinned to versions
+├── pyproject.toml            # packaging config: after `pip install .` the `botkit` command is available
 ├── pytest.ini
 ├── botkit/                   # the framework, colleagues don't need to touch it
 │   ├── cli.py                # ui / new / validate / run / serve-api
@@ -194,7 +195,8 @@ bot-demo/
 │   └── _skills/              # shared skill docs (*.md), multiple Agents can opt in
 ├── tools/
 │   ├── wecom_probe.py        # probe the user identity WeCom provides (CLI version)
-│   └── mcp_probe.py          # probe the MCP tool list and connectivity (CLI version)
+│   ├── mcp_probe.py          # probe the MCP tool list and connectivity (CLI version)
+│   └── smoke_wheel.py        # packaging smoke test: install the wheel in a clean env and check it works
 └── tests/                    # unit tests
 ```
 
@@ -243,6 +245,11 @@ python -m pytest
 Runs in a few seconds, needs no network and burns no tokens: MCP-related tests use the SDK's in-memory
 transport (real protocol, no network), LLM-related tests use a fake backend,
 and the config page uses aiohttp's built-in test client to spin up a real service.
+
+You can also install the project as a command-line tool: run `pip install .` in the repository directory,
+then use `botkit ...` instead of `python -m botkit ...` (packaging config lives in `pyproject.toml`; it is
+not published to PyPI yet, so install from the source directory). Agent configs such as `bots/` and `.env`
+stay in the directory you run commands from; they are not installed with the package.
 
 Technical prerequisites:
 

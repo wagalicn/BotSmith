@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# 发行名叫 botsmith；代码里导入的包名仍是 botkit，两者不必相同。
+# 尚未发布到 PyPI（发布需要单独确认），此处只是让项目可以被构建和安装。
+name = "botsmith"
+dynamic = ["version"]
+description = "企业微信 Agent 通用骨架：配置驱动，内置 LLM function calling 与 MCP 工具调用"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+
+# 运行时依赖。范围要和 requirements.txt 保持一致，目前靠人工同步，改依赖时两处都要改。
+dependencies = [
+    "wecom-aibot-python-sdk>=1.0.2,<2",
+    # MCP 必须是 2.x：代码用的是 v2 API（mcp.Client、httpx2、input_schema 等）。
+    "mcp>=2.2,<3",
+    "httpx2>=2.13,<3",
+    "openai>=3.14,<4",
+    "aiohttp>=3.14,<4",
+    "PyYAML>=6.0,<7",
+    "python-dotenv>=1.2,<2",
+]
+
+[project.optional-dependencies]
+# 跑测试需要的依赖（部署时不需要）。
+test = [
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+]
+
+[project.scripts]
+# 安装后可直接用 `botkit ...`，等价于 `python -m botkit ...`。
+botkit = "botkit.cli:main"
+
+[tool.setuptools]
+# 显式列出包，避免把 tests/、tools/、bots/ 等目录误打进 wheel。
+packages = [
+    "botkit",
+    "botkit.llm",
+    "botkit.portal",
+    "botkit.portal.auth",
+    "botkit.ui",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "botkit.__version__" }
+
+[tool.setuptools.package-data]
+# scaffold.py 和 ui/server.py 在运行时用 Path(__file__).parent 读取这些文件，
+# 不进 wheel 的话，安装后 `new` 命令和配置页会坏。
+"botkit" = ["templates/*.tmpl"]
+"botkit.ui" = ["static/*"]
