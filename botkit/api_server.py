@@ -13,6 +13,9 @@
 
     GET /health -> {"ok": true, "bot": "<name>"}   （探活，免鉴权）
 
+    GET /.well-known/agent-card.json -> Agent 名片（自我介绍，见 botkit/agent_card.py）
+      Header: Authorization: Bearer <token>   （和 /chat 一样要鉴权）
+
 自定义端点：bot 可以在自己的 hooks.py 里实现 register_routes(app, config,
 pipeline)，往这个 app 上挂它特有的路由（比如某个 bot 的结构化分析端点）。
 框架在应用级中间件统一执行 Bearer 鉴权和请求体大小限制；业务 handler
@@ -36,6 +39,7 @@ from typing import Any
 
 from aiohttp import web
 
+from botkit.agent_card import CARD_PATH, build_agent_card
 from botkit.config import (
     BotConfig,
     get_message_lang,
@@ -300,6 +304,31 @@ async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "bot": cfg.name})
 
 
+def _dumps_utf8(data: Any) -> str:
+    """名片里有中文，直接输出 UTF-8 而不是 \\uXXXX 转义，curl 看着省事。"""
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _card_base_url(request: web.Request) -> str:
+    """
+    这个 Agent 对外的根地址，由收到的请求推出：协议和主机取自本次请求，
+    再加上网关的挂载前缀（单 Agent 时没有前缀）。
+
+    经反向代理对外时，这里拿到的协议和主机可能不是调用方看到的那个。
+    """
+    path = request.rel_url.raw_path
+    prefix = path[: -len(CARD_PATH)] if path.endswith(CARD_PATH) else ""
+    return f"{request.scheme}://{request.host}{prefix}"
+
+
+async def _handle_agent_card(request: web.Request) -> web.Response:
+    """GET /.well-known/agent-card.json：本 Agent 的名片，鉴权规则和其他路由一致。"""
+    cfg: BotConfig = request.app[CONFIG]
+    return web.json_response(
+        build_agent_card(cfg, _card_base_url(request)), dumps=_dumps_utf8
+    )
+
+
 def create_api_app(
     config: BotConfig,
     pipeline: MessagePipeline,
@@ -314,8 +343,8 @@ def create_api_app(
 
     base_path 是自定义路由的前缀（默认 ""）：单 Agent 模式传空（裸路径，
     现状不变）；将来多 Agent 网关模式传 "/{agent}"，透传给 bot 的
-    register_routes。注意 /chat、/health 是框架内置端点，仍挂在裸路径上；
-    base_path 只影响 bot 通过 register_routes 挂的自定义路由。
+    register_routes。注意 /chat、/health 和名片端点是框架内置端点，仍挂在
+    裸路径上；base_path 只影响 bot 通过 register_routes 挂的自定义路由。
     """
     if not config.api.token:
         raise ValueError("创建 Agent API 时必须配置非空的 api.token")
@@ -328,6 +357,7 @@ def create_api_app(
     app[PIPELINE] = pipeline
     app.router.add_post("/chat", _handle_chat)
     app.router.add_get("/health", _handle_health, name=HEALTH_ROUTE_NAME)
+    app.router.add_get(CARD_PATH, _handle_agent_card)
 
     if hooks is not None and hooks.has_routes:
         logger.info("加载 bot 自定义路由（register_routes），前缀=%r", base_path)
@@ -376,7 +406,9 @@ async def _handle_agents(request: web.Request) -> web.Response:
     """
     GET /agents：列出网关里所有 Agent 及在线状态（名字、是否可用、错误原因）。
 
-    免鉴权——这是给门户列卡片用的发现接口，不涉及对话内容或密钥。
+    免鉴权——这是给门户列出有哪些 Agent 用的发现接口，不涉及对话内容或密钥。
+    所以这里只有名字、状态和路径，**不含**简介和技能说明：这些在名片里，
+    要带该 Agent 的 token 去取 /{agent}/.well-known/agent-card.json。
     """
     agents: list[GatewayAgent] = request.app[AGENTS]
     return web.json_response(
