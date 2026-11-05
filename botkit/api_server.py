@@ -5,9 +5,9 @@
 和企微长连接共用同一套对话逻辑（build_pipeline），只是入口从企微消息帧
 换成了 HTTP 请求。
 
-契约（无状态透传）：
+契约：
     POST /chat
-      Header: Authorization: Bearer <token>   （配了 token 才校验）
+      Header: Authorization: Bearer <token>   （API 启用时必填）
       Body:   {"message": "...", "user": "L220104", "session_id": "可选"}
       Resp:   {"reply": "...", "kind": "llm", "session_id": "..."}
 
@@ -15,19 +15,20 @@
 
 自定义端点：bot 可以在自己的 hooks.py 里实现 register_routes(app, config,
 pipeline)，往这个 app 上挂它特有的路由（比如某个 bot 的结构化分析端点）。
-框架只负责在组装完 /chat、/health 后调用它，具体路由是 bot 的业务，不进
-骨架。鉴权可复用 _check_auth。
+框架在应用级中间件统一执行 Bearer 鉴权和请求体大小限制；业务 handler
+仍负责校验自己的字段和权限。
 
 设计要点：
 - user / session_id 由调用方（门户/Dify）提供，本服务不发号、不做账号体系。
 - 同一 (user, session_id) 的连续请求 = 连续多轮对话，上下文由 SessionStore 维持。
 - 不传 session_id 时退化成「按 user 隔离」（每个用户一条上下文）。
-- 绑 0.0.0.0：这个服务只对话、不读写密钥或磁盘配置，暴露到内网是安全的
-  （和「配置页面」只绑本机不同）。
+- 绑 0.0.0.0：必须经受控网络或 TLS 反向代理暴露；框架负责 Bearer 鉴权，
+  MCP 服务端仍需做最终身份授权。配置页面继续只绑本机。
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from dataclasses import dataclass
@@ -45,6 +46,14 @@ from botkit.hooks import Hooks
 from botkit.runtime import MessagePipeline
 
 logger = logging.getLogger("botkit.api")
+
+# 明确限制所有 Agent API（包括 register_routes 自定义端点）的请求体。
+# 字段上限还会在 /chat 解析后单独检查，避免超长身份、会话 key 和 prompt。
+MAX_REQUEST_BYTES = 1024 * 1024
+MAX_MESSAGE_CHARS = 100_000
+MAX_USER_CHARS = 256
+MAX_SESSION_ID_CHARS = 256
+HEALTH_ROUTE_NAME = "botkit-health"
 
 
 def _m(zh: str, en: str) -> str:
@@ -65,14 +74,15 @@ def check_auth(request: web.Request, cfg: BotConfig) -> web.Response | None:
     """
     校验 Authorization: Bearer <token>。
 
-    配了 token 才校验；通过（或没配 token）返回 None，失败返回 401 响应。
-    /chat 用它做鉴权，bot 通过 register_routes 挂的自定义路由也可以复用。
+    正常配置加载会保证 API 启用时 token 非空；空 token 分支仅保留给直接
+    构造配置的测试和向后兼容调用。所有 Agent 子应用路由由安全中间件统一调用。
     """
     token = cfg.api.token
     if not token:
         return None
     auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {token}":
+    expected = f"Bearer {token}"
+    if not hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
         return web.json_response(
             {"error": _m(
                 "未授权：请在请求头带 Authorization: Bearer <token>",
@@ -81,6 +91,58 @@ def check_auth(request: web.Request, cfg: BotConfig) -> web.Response | None:
             status=401,
         )
     return None
+
+
+@web.middleware
+async def api_security_middleware(
+    request: web.Request, handler: Any
+) -> web.StreamResponse:
+    """
+    对内置和 register_routes 自定义端点统一执行鉴权。
+
+    只有框架命名的 liveness 路由免鉴权。语言上下文也在这里设置，确保在
+    handler 之前返回的 401 能遵循 Accept-Language。
+    """
+    language_token = set_message_lang(
+        _lang_from_header(request.headers.get("Accept-Language", ""))
+    )
+    try:
+        route_name = getattr(request.match_info.route, "name", None)
+        if route_name != HEALTH_ROUTE_NAME:
+            cfg: BotConfig = request.app[CONFIG]
+            unauthorized = check_auth(request, cfg)
+            if unauthorized is not None:
+                return unauthorized
+        return await handler(request)
+    finally:
+        reset_message_lang(language_token)
+
+
+def _text_field(
+    payload: dict[str, Any], name: str, max_chars: int
+) -> tuple[str, web.Response | None]:
+    """读取并限制 /chat 字符串字段；不把对象或数字静默转成字符串。"""
+    raw = payload.get(name)
+    if raw is None:
+        return "", None
+    if not isinstance(raw, str):
+        return "", web.json_response(
+            {"error": _m(
+                f"{name} 应该是字符串",
+                f"{name} must be a string",
+            )},
+            status=400,
+        )
+    value = raw.strip()
+    if len(value) > max_chars:
+        return "", web.json_response(
+            {"error": _m(
+                f"{name} 过长，最多允许 {max_chars} 个字符",
+                f"{name} is too long; the limit is {max_chars} characters",
+            )},
+            status=413,
+        )
+    return value, None
 
 
 def _frame_from_request(message: str, user: str, session_id: str) -> dict[str, Any]:
@@ -104,19 +166,14 @@ def _frame_from_request(message: str, user: str, session_id: str) -> dict[str, A
 
 
 async def _handle_chat(request: web.Request) -> web.Response:
-    cfg: BotConfig = request.app[CONFIG]
-
     # 对外接口按调用方的 Accept-Language 返回中/英错误；默认中文。
     # 用 try/finally 恢复，避免污染后续请求。
     token = set_message_lang(_lang_from_header(request.headers.get("Accept-Language", "")))
     try:
-        # 鉴权：配了 token 才校验 Authorization: Bearer <token>
-        unauthorized = check_auth(request, cfg)
-        if unauthorized is not None:
-            return unauthorized
-
         try:
             payload = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception:
             return web.json_response(
                 {"error": _m("请求体不是合法 JSON", "The request body is not valid JSON")},
@@ -128,9 +185,17 @@ async def _handle_chat(request: web.Request) -> web.Response:
                 status=400,
             )
 
-        message = str(payload.get("message") or "").strip()
-        user = str(payload.get("user") or "").strip()
-        session_id = str(payload.get("session_id") or "").strip()
+        message, error = _text_field(payload, "message", MAX_MESSAGE_CHARS)
+        if error is not None:
+            return error
+        user, error = _text_field(payload, "user", MAX_USER_CHARS)
+        if error is not None:
+            return error
+        session_id, error = _text_field(
+            payload, "session_id", MAX_SESSION_ID_CHARS
+        )
+        if error is not None:
+            return error
 
         if not message:
             return web.json_response(
@@ -252,11 +317,17 @@ def create_api_app(
     register_routes。注意 /chat、/health 是框架内置端点，仍挂在裸路径上；
     base_path 只影响 bot 通过 register_routes 挂的自定义路由。
     """
-    app = web.Application()
+    if not config.api.token:
+        raise ValueError("创建 Agent API 时必须配置非空的 api.token")
+
+    app = web.Application(
+        middlewares=[api_security_middleware],
+        client_max_size=MAX_REQUEST_BYTES,
+    )
     app[CONFIG] = config
     app[PIPELINE] = pipeline
     app.router.add_post("/chat", _handle_chat)
-    app.router.add_get("/health", _handle_health)
+    app.router.add_get("/health", _handle_health, name=HEALTH_ROUTE_NAME)
 
     if hooks is not None and hooks.has_routes:
         logger.info("加载 bot 自定义路由（register_routes），前缀=%r", base_path)

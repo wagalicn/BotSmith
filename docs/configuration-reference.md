@@ -38,7 +38,7 @@ When something is misconfigured, `python -m botkit validate <bot dir>` points ou
 | `wecom.bot_secret` | no* | — | WeCom Agent secret (can be blank for API-only) |
 | `api.enabled` | no | `false` | Enable the external chat API (POST /chat) |
 | `api.port` | no | `9000` | Port the chat API listens on |
-| `api.token` | no | — | Chat API auth token, blank = no auth |
+| `api.token` | yes when API is enabled | — | Chat API auth token; must be non-empty |
 | `llm.client` | no | `openai` | LLM backend, `openai` / `aiohttp` / `anthropic` |
 | `llm.api_url` | yes | — | LLM endpoint, written differently per backend |
 | `llm.api_key` | yes | — | LLM key |
@@ -114,7 +114,7 @@ It can run alongside WeCom, or on its own without WeCom.
 |---|---|---|
 | `enabled` | `false` | When on, the runtime starts an HTTP service |
 | `port` | `9000` | Listening port. Use different ports when deploying multiple Agents on one machine |
-| `token` | — | Auth token, use a `${VAR}` placeholder with the real value in `.env`. Blank = no auth |
+| `token` | — | Auth token; use a `${VAR}` placeholder with the real value in `.env`. It is required when the API is enabled |
 
 **Ways to start**:
 
@@ -152,19 +152,24 @@ BOTKIT_API_PORT=9003 python -m botkit serve-api bots/your-bot          # macOS/L
 
 ```
 POST http://<server IP>:<port>/chat
-Header:  Authorization: Bearer <token>     # only needed if a token is configured
+Header:  Authorization: Bearer <token>     # required
 Body:    {"message": "what the user said", "user": "L220104", "session_id": "conv-1"}
 Resp:    {"reply": "Agent reply", "kind": "llm", "session_id": "conv-1"}
 
 GET  http://<server IP>:<port>/health         # liveness check, no auth
 ```
 
-- **`user`**: provided by the caller (portal / Dify), representing the current user. If the Agent configures
-  `identity.pattern`, this value must also match the format (e.g. employee ID `L220104`), otherwise it is rejected by identity validation.
+Input limits: 1 MiB per request body, 100,000 characters for `message`, and 256 characters
+each for `user` and `session_id`. Fields must be strings. Oversized values return 413;
+wrong types return 400.
+
+- **`user`**: supplied by the calling system (portal / Dify) as the user it has already authenticated. Format validation
+  is not authentication; the caller must guarantee that this value is trustworthy. If `identity.pattern` is configured,
+  the value must also match it (for example `L220104`) or the request is rejected.
 - **`session_id`**: provided by the caller, determines multi-turn context isolation. Consecutive requests with the same `session_id`
   = continuous conversation; a different one = a new conversation; without it, isolation is by `user`.
-- The API binds to `0.0.0.0` (reachable on the intranet). It only chats, never reads/writes secrets or disk config,
-  a different security trade-off from the "config page" (bound to localhost only).
+- The API binds to `0.0.0.0`. Put it behind a controlled network or TLS reverse proxy and use a high-entropy token.
+  MCP servers must still enforce end-user authorization; the config page remains local-only.
 
 **Integrating with Dify**: in Dify, use a "custom tool / HTTP request" node pointing at this `/chat`,
 passing Dify's current user as `user` and Dify's conversation_id as `session_id`.
@@ -182,14 +187,15 @@ attach your own routes there.
 
 ### The skeleton vs. business boundary
 
-A custom endpoint is **one Agent's business**, not part of the common skeleton. The skeleton only provides the
-`register_routes` mounting point (valuable to all Agents); what endpoints to mount and what they do is entirely up to each
-Agent, with the code kept inside that Agent's directory, out of the skeleton.
+A custom endpoint is **one Agent's business**, not part of the common skeleton. The skeleton provides the
+`register_routes` mounting point and applies Bearer authentication plus a 1 MiB request-body limit to the whole
+Agent app. Each Agent still validates its own fields, business permissions, and LLM output. The endpoint code stays
+inside the Agent directory.
 
 ```mermaid
 flowchart TB
     subgraph SK["Skeleton botkit/ (common)"]
-        API["api_server.py<br/>/chat · /health · check_auth"]
+        API["api_server.py<br/>shared auth · request limit · /chat · /health"]
         HK["hooks.py<br/>register_routes extension point"]
         EN["engine / llm<br/>build_system_prompt · backend.complete"]
     end
@@ -199,7 +205,7 @@ flowchart TB
         BH -->|load by file path| BE
     end
     HK -.called at startup.-> BH
-    BE -.reuse auth/engine.-> API
+    BE -.reuse engine.-> API
     BE -.reuse auth/engine.-> EN
 ```
 
@@ -210,11 +216,10 @@ flowchart TB
 def register_routes(app, config, pipeline):
     """Called once when the external service starts, to mount custom routes onto the aiohttp app."""
     from aiohttp import web
-    from botkit.api_server import check_auth
 
     async def handle_echo(request):
-        if (resp := check_auth(request, config)) is not None:  # reuse auth
-            return resp
+        # The framework middleware handles Bearer auth and total body size.
+        # The handler still validates fields and business permissions.
         payload = await request.json()
         return web.json_response({"echo": payload})
 
@@ -237,9 +242,9 @@ Once the Agent starts, `/echo` is mounted on the same port as `/chat` and `/heal
   with a fixed signature `register_routes(app, config, pipeline)`.
 - The framework calls it after assembling `/chat` and `/health`. A mounting error makes startup fail outright
   (no silent downgrade) —— routes are an Agent's core capability, so if they can't come up, that should surface.
-- **Reuse the skeleton**: `check_auth(request, config)` uses the same `api.token` as `/chat`;
-  when you need the LLM, `pipeline.engine.backend.complete(messages, tools)` is a ready backend,
-  and `pipeline.engine.build_system_prompt(identity)` gives you the system prompt assembled from prompt.md + skills.
+- **Shared security boundary**: except for the framework `/health`, built-in and custom routes are authenticated by
+  application middleware with the same `api.token` and share the request-body limit. Handlers should not repeat
+  `check_auth`; they must still validate fields, user permissions, and LLM output.
 - **Stateless**: a custom endpoint is usually one-shot; don't reuse `/chat`'s session logic or write to SessionStore;
   just carry all needed fields in each request.
 - **Two layers of validation**: one validates input (don't trust the caller), one validates LLM output (don't trust the model),
@@ -254,7 +259,7 @@ Once the Agent starts, `/echo` is mounted on the same port as `/chat` and `/heal
    `register_myfeature_route(app, config, pipeline)`.
 2. Implement `register_routes` in `bots/<bot>/hooks.py`, load `myfeature.py` by file path
    and call its registration function.
-3. In the handler, use `check_auth` for auth and `engine.backend.complete` to call the LLM, staying stateless.
+3. In the handler, validate fields and business permissions and call `engine.backend.complete` as needed; the framework handles Bearer auth.
 4. Write tests under `bots/<bot>/tests/` (`pytest.ini`'s `testpaths` already includes `bots`,
    so `python -m pytest` discovers them automatically); integration tests should go through the real
    `load_hooks → create_api_app` mounting chain.
@@ -603,8 +608,9 @@ so the model won't answer the user based on its own rejected record (e.g. "creat
 **Every "act on someone's behalf" tool should be configured.** This is a code-level guarantee,
 not dependent on writing "don't fabricate employee IDs" in the prompt —— prompts can be bypassed.
 
-Execution order: `identity.inject` → `before_tool_call` hook → the actual call.
-So the hook can see the injected identity and can also override it.
+Execution order: `identity.inject` → `before_tool_call` hook → apply `identity.inject`
+again → argument-size check → the actual call. The hook sees the injected identity but cannot override
+the trusted identity ultimately sent to MCP. Tool-argument JSON larger than 64 KiB is rejected.
 
 ---
 
@@ -706,6 +712,8 @@ Most Agents don't need to write code. When needed, implement any of the function
 | `before_reply` | `(text, ctx) -> str` | unified signature, append a help entry |
 
 `ctx` carries `identity`, `session_key`, `config`, `logger`, `frame`.
+In multi-Agent mode, read this Agent's `.env` with `ctx.config.env_value("NAME")` rather than
+reading the process-global `os.environ` on every request.
 
 ```python
 # hooks.py
@@ -724,9 +732,10 @@ def resolve_identity(frame):
 
 A few conventions:
 
-- **A hook raising an exception won't crash the Agent**: the framework logs an ERROR (with full stack trace) and
-  falls back to default behavior. So you don't need a pile of try/except in hooks.
-- **A wrong return type also falls back**, likewise logged.
+- **Most hooks raising an exception won't crash the Agent**: the framework logs an ERROR and falls back to default behavior.
+- **`before_tool_call` is the exception**: it is a pre-execution security boundary. If it raises or returns a non-dict,
+  that tool call is rejected and an error result is sent to the model; unchecked arguments are never executed.
+- A wrong return type from other hooks falls back and is logged.
 - **A misspelled hook name gets a WARNING**, it won't silently fail.
 - **A syntax error or import failure in `hooks.py` errors out directly**, it's not skipped ——
   a file sitting right there but silently not taking effect is harder to debug.
@@ -771,7 +780,11 @@ Source and priority of variables:
 2. The `.env` file in the Agent directory
 
 Process environment variables take priority so containers/CI can inject secrets directly without changing files.
-The side effect: if you've `set`/`export`'d a same-named variable in your shell, it overrides the value in `.env`.
+Each Agent's `.env` is parsed into an isolated snapshot and is never written back to process-global `os.environ`,
+so same-named variables do not bleed across Agents. Hooks can read the snapshot during module import; at runtime,
+use `ctx.config.env_value("NAME")`.
+
+A same-named variable previously `set`/`export`ed in the shell still overrides `.env` by design.
 In that case the framework logs a WARNING naming which variables:
 
 ```
@@ -803,7 +816,9 @@ A WeCom message comes in
  11. LLM loop, up to llm.max_tool_rounds rounds:
        model wants to call a tool →
          identity.inject overrides identity args (logs WARNING)
-         hooks.before_tool_call rewrites args
+         hooks.before_tool_call rewrites args; failure rejects the call without executing it
+         apply identity.inject again so the hook cannot override trusted identity
+         validate tool-argument JSON size (64 KiB limit)
          push the matching messages.tool_progress copy
          call the tool (connection reused within a turn)
          hooks.after_tool_call processes the result

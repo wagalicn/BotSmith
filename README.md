@@ -65,16 +65,18 @@ python -m botkit serve-api bots/my-agent       # 只起接口（Windows 可双�
 
 ```
 POST http://<服务器IP>:<port>/chat
-Header:  Authorization: Bearer <token>     # 配了 token 才需要
+Header:  Authorization: Bearer <token>     # 必填
 Body:    {"message": "用户说的话", "user": "L220104", "session_id": "conv-1"}
 Resp:    {"reply": "Agent回复", "kind": "llm", "session_id": "conv-1"}
 
 GET  http://<服务器IP>:<port>/health         # 探活，免鉴权
 ```
 
-- **`user` / `session_id` 由调用方提供**：门户/Dify 传当前用户和会话 ID，
-  Agent 无状态透传。同一 `session_id` 连续请求 = 连续多轮；不传则按 `user` 隔离。
-- 接口绑 `0.0.0.0`（内网可达），只对话、不读写密钥，和「配置页面」（只绑本机）取舍不同。
+- **`user` / `session_id` 由调用方提供**：门户/Dify 传当前用户和会话 ID。
+  服务端会按它们在进程内保存多轮历史；同一 `session_id` 连续请求 = 连续多轮，
+  不传则按 `user` 隔离。`user` 是调用系统声明的值，调用系统必须先完成真实用户认证。
+- 接口绑定 `0.0.0.0`。应部署在受控网络或 TLS 反向代理后，并设置高熵 token；
+  MCP 服务端仍须校验最终用户权限。配置页面继续只允许本机访问。
 
 字段和 Dify 对接细节见 [配置参考的 api 段](docs/配置参考.md#api-对外接口)。
 
@@ -129,17 +131,19 @@ GET  http://<服务器IP>:<port>/health         # 探活，免鉴权
 
 ## 对外接口详解（对接 Dify / 门户 / 第三方）
 
-在配置页「对外接口」页打开开关、填端口和 token（也可留空不鉴权），
-或直接在 `bot.yaml` 配 `api` 段。
+在配置页「对外接口」页打开开关、填端口和非空 token，
+或直接在 `bot.yaml` 配 `api` 段。接口启用时缺少 token 会校验失败。
 
 - **两种启动**：`serve-api`（只起接口、不连企微，这种 Agent 的企微 bot_id/secret 可以不填）
   或 `run`（连企微时一并起接口）。
-- 接口无状态、只对话、不读写密钥，绑 `0.0.0.0` 内网可达。
+- API 由调用方提供会话标识，服务端在进程内维护对话历史；接口绑定 `0.0.0.0`，
+  应放在受控网络或 TLS 反向代理后。
 
 **对接 Dify**：在 Dify 里用「自定义工具 / HTTP 请求」节点指向这个 `/chat`，
 把 Dify 的当前用户传给 `user`、conversation_id 传给 `session_id`。
 
-> 后续的门户方向规划（一进程多 Agent、流式、聚合门户页）见 [TODO.md](TODO.md)。
+> 多 Agent 网关和 SSE 已实现；门户、Redis 与工程化工作的当前状态见
+> [TODO.md](TODO.md)。
 
 ---
 
@@ -161,7 +165,7 @@ bot-demo/
 ├── start_ui.py               # 上面脚本共用的启动逻辑
 ├── README.md
 ├── README.en.md              # English version
-├── TODO.md                   # 门户方向的后续规划
+├── TODO.md                   # 当前状态与后续阶段索引
 ├── docs/
 │   ├── 新建Bot步骤说明书.md
 │   └── 配置参考.md

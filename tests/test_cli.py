@@ -449,7 +449,7 @@ def test_serve_api_single_agent_dispatch(tmp_path, monkeypatch, base_env):
     bot_dir = tmp_path / "solo"
     bot_dir.mkdir()
     (bot_dir / "bot.yaml").write_text(
-        MINIMAL_YAML + "\napi:\n  enabled: true\n", encoding="utf-8"
+        MINIMAL_YAML + "\napi:\n  enabled: true\n  token: test-token\n", encoding="utf-8"
     )
     (bot_dir / "prompt.md").write_text("你是测试。", encoding="utf-8")
 

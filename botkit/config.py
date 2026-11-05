@@ -20,10 +20,10 @@ import re
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 logger = logging.getLogger("botkit.config")
 
@@ -106,7 +106,7 @@ class ApiConfig:
 
     enabled: bool = False
     port: int = 9000
-    # 请求头 Authorization: Bearer <token> 的校验值。留空 = 不鉴权。
+    # 请求头 Authorization: Bearer <token> 的校验值。API 启用时必须配置。
     token: str = ""
 
 
@@ -244,6 +244,15 @@ class BotConfig:
     skills_text: str = ""
     # 对外 chat HTTP 接口
     api: ApiConfig = field(default_factory=ApiConfig)
+    # 本 Agent 的 .env 快照。不会写入 repr，避免调试输出泄露密钥。
+    # 多 Agent 模式下 hook 应通过 env_value() 读取，不能依赖全局 os.environ。
+    env_values: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def env_value(self, name: str, default: str = "") -> str:
+        """读取本 Agent 的环境值；进程显式注入仍优先于 .env。"""
+        if name in self.env_values:
+            return self.env_values[name]
+        return os.environ.get(name, default)
 
     def inject_for(self, tool_name: str) -> list[str]:
         """该工具需要被强制注入身份的参数名列表"""
@@ -260,17 +269,27 @@ class BotConfig:
 # --------------------------------------------------------------------------
 
 
-def _substitute_env(node: Any, path: str, missing: list[str]) -> Any:
+def _substitute_env(
+    node: Any,
+    path: str,
+    missing: list[str],
+    environ: Mapping[str, str] | None = None,
+) -> Any:
     """
     递归替换配置树里的 ${VAR}。
-    缺失的变量收集到 missing（而不是第一个就抛错），一次性把问题全报出来。
+
+    environ 默认使用当前进程环境；加载 bot 时会传入“进程环境 + 该 bot 的
+    .env 快照”，避免为了替换占位符而永久修改全局 os.environ。
+    缺失变量全部收集后一次性报出。
     """
+    values = os.environ if environ is None else environ
+
     if isinstance(node, str):
         found: list[str] = []
 
         def _replace(m: re.Match[str]) -> str:
             var = m.group(1)
-            val = os.environ.get(var)
+            val = values.get(var)
             if val is None:
                 found.append(var)
                 return ""
@@ -286,13 +305,16 @@ def _substitute_env(node: Any, path: str, missing: list[str]) -> Any:
 
     if isinstance(node, dict):
         return {
-            k: _substitute_env(v, f"{path}.{k}" if path else str(k), missing)
+            k: _substitute_env(
+                v, f"{path}.{k}" if path else str(k), missing, values
+            )
             for k, v in node.items()
         }
 
     if isinstance(node, list):
         return [
-            _substitute_env(v, f"{path}[{i}]", missing) for i, v in enumerate(node)
+            _substitute_env(v, f"{path}[{i}]", missing, values)
+            for i, v in enumerate(node)
         ]
 
     return node
@@ -465,14 +487,19 @@ def _parse_api(raw: Any) -> ApiConfig:
     if not data:
         return ApiConfig()
     _reject_unknown(data, {"enabled", "port", "token"}, "api")
+    enabled = bool(data.get("enabled", False))
     port = ApiConfig().port
     if data.get("port") is not None:
         port = _opt_int(data, "port", "api", ApiConfig().port)
-    return ApiConfig(
-        enabled=bool(data.get("enabled", False)),
-        port=port,
-        token=_opt_str(data, "token", "api", "") or "",
-    )
+    token = _opt_str(data, "token", "api", "") or ""
+    if enabled and not token:
+        raise ConfigError(_m(
+            "api.enabled=true 时必须配置非空的 api.token。请在 .env 中设置 "
+            "CHAT_API_TOKEN，并在 bot.yaml 使用 ${CHAT_API_TOKEN}",
+            "api.token must be non-empty when api.enabled=true. Set "
+            "CHAT_API_TOKEN in .env and use ${CHAT_API_TOKEN} in bot.yaml",
+        ))
+    return ApiConfig(enabled=enabled, port=port, token=token)
 
 
 def _parse_llm(raw: Any) -> LlmConfig:
@@ -965,29 +992,35 @@ def resolve_bot_dir(bot_dir: str | Path) -> Path:
     return path
 
 
-def _load_env_file(env_file: Path) -> None:
+def _load_env_file(env_file: Path) -> dict[str, str]:
     """
-    加载 bot 目录下的 .env。
+    解析 bot 目录下的 .env，返回这个 Agent 自己的环境快照。
 
-    已经存在的进程环境变量优先（override=False），这样容器/CI 可以直接注入
-    密钥而不用改文件。但这有个坑：shell 里残留一个同名变量，就会静默盖掉
-    .env 里的值，人还以为改生效了。所以被盖住的变量要明确打出来。
+    已存在的进程环境变量优先，方便容器/CI 注入。这里不再调用
+    load_dotenv，也不会永久修改 os.environ；否则同一进程顺序加载多个 Agent
+    时，第一个 Agent 的同名变量会污染后续 Agent。
     """
-    from dotenv import dotenv_values
-
     try:
-        file_vars = dotenv_values(env_file)
+        raw_values = dotenv_values(env_file)
     except Exception:
-        file_vars = {}
+        raw_values = {}
 
+    file_values = {
+        str(name): str(value)
+        for name, value in raw_values.items()
+        if value is not None
+    }
     shadowed = [
         name
-        for name, value in file_vars.items()
-        if value is not None and name in os.environ and os.environ[name] != value
+        for name, value in file_values.items()
+        if name in os.environ and os.environ[name] != value
     ]
+    resolved = {
+        name: os.environ.get(name, value)
+        for name, value in file_values.items()
+    }
 
-    load_dotenv(env_file, override=False)
-    logger.debug("已加载环境变量文件 %s", env_file)
+    logger.debug("已解析环境变量文件 %s（未写入全局环境）", env_file)
 
     if shadowed:
         logger.warning(
@@ -996,6 +1029,8 @@ def _load_env_file(env_file: Path) -> None:
             env_file,
             "、".join(sorted(shadowed)),
         )
+
+    return resolved
 
 
 def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
@@ -1008,12 +1043,18 @@ def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
     path = resolve_bot_dir(bot_dir)
     config_path = path / "bot.yaml"
 
+    bot_env: dict[str, str] = {}
     if load_env:
         env_file = path / ".env"
         if env_file.is_file():
-            _load_env_file(env_file)
+            bot_env = _load_env_file(env_file)
         else:
             logger.debug("bot 目录下没有 .env，只使用进程环境变量：%s", path)
+
+    # 配置替换读取进程环境和本 Agent 的 .env 快照。bot_env 中同名值已经按
+    # “进程环境优先”解析，因此合并不会改变容器/CI 注入的优先级。
+    substitution_env = dict(os.environ)
+    substitution_env.update(bot_env)
 
     try:
         raw_text = config_path.read_text(encoding="utf-8")
@@ -1044,7 +1085,7 @@ def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
 
     # 占位符替换：把所有缺失的环境变量一次性报出来
     missing: list[str] = []
-    raw = _substitute_env(raw, "", missing)
+    raw = _substitute_env(raw, "", missing, substitution_env)
     if missing:
         detail = "\n".join(f"  - {m}" for m in missing)
         raise ConfigError(_m(
@@ -1093,6 +1134,7 @@ def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
         skills_files=skills_files,
         skills_text=skills_text,
         api=api,
+        env_values=bot_env,
     )
 
 
@@ -1316,7 +1358,7 @@ def config_summary(cfg: BotConfig) -> str:
     lines.append("[对外接口]")
     if cfg.api.enabled:
         lines.append(f"  chat 接口      : 已开启，端口 {cfg.api.port}")
-        lines.append(f"  鉴权 token     : {mask_secret(cfg.api.token) if cfg.api.token else '(不鉴权)'}")
+        lines.append(f"  鉴权 token     : {mask_secret(cfg.api.token) if cfg.api.token else '(缺失，配置无效)'}")
     else:
         lines.append("  chat 接口      : 未开启")
     lines.append("")
@@ -1408,7 +1450,7 @@ def _config_summary_en(cfg: BotConfig) -> str:
     lines.append("[External API]")
     if cfg.api.enabled:
         lines.append(f"  chat API      : enabled, port {cfg.api.port}")
-        lines.append(f"  auth token    : {mask_secret(cfg.api.token) if cfg.api.token else '(no auth)'}")
+        lines.append(f"  auth token    : {mask_secret(cfg.api.token) if cfg.api.token else '(missing; invalid config)'}")
     else:
         lines.append("  chat API      : disabled")
     lines.append("")

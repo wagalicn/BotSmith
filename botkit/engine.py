@@ -20,11 +20,14 @@ import re
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from botkit.config import BotConfig, ContentWatcher
-from botkit.hooks import HookContext, Hooks
+from botkit.hooks import BeforeToolCallRejected, HookContext, Hooks
 from botkit.llm.base import LlmBackend, LlmError, TokenUsage
 from botkit.mcp_client import McpToolClient
 
 logger = logging.getLogger("botkit.engine")
+
+MAX_IDENTITY_CHARS = 256
+MAX_TOOL_ARGUMENT_BYTES = 64 * 1024
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 # (工具名, 实际发出的参数, 工具返回的文本)
@@ -52,11 +55,29 @@ def identity_matches(identity: str | None, pattern: str | None) -> bool:
     注意空身份：配了 pattern 就意味着这个 bot 依赖身份，
     拿不到身份时必须判为不合法，不能放过去。
     """
+    if identity is not None and len(identity) > MAX_IDENTITY_CHARS:
+        return False
     if pattern is None:
         return True
     if not identity:
         return False
-    return re.match(pattern, identity) is not None
+    return re.fullmatch(pattern, identity) is not None
+
+
+def _tool_arguments_error(arguments: dict[str, Any]) -> str | None:
+    """返回工具参数拒绝原因；合法且不超过大小限制时返回 None。"""
+    try:
+        raw = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return "工具参数不是合法的 JSON 对象"
+    if len(raw) > MAX_TOOL_ARGUMENT_BYTES:
+        return f"工具参数超过 {MAX_TOOL_ARGUMENT_BYTES} 字节上限"
+    return None
 
 
 class BotEngine:
@@ -268,7 +289,7 @@ class BotEngine:
         ctx: HookContext,
         on_progress: ProgressCallback | None,
         on_tool_call: ToolCallObserver | None,
-    ) -> None:
+    ) -> int:
         """
         处理一轮工具调用：把 assistant 消息入上下文，对每个 tool_call 做身份
         强制注入、hook 改写、参数同步，调用工具并把结果回灌进 messages。
@@ -280,11 +301,24 @@ class BotEngine:
         assistant_message = resp.message
         messages.append(assistant_message)
 
+        def reject_call(index: int, tc: Any, args: dict[str, Any], reason: str) -> None:
+            _sync_tool_call_args(assistant_message, index, args)
+            logger.warning("拒绝工具调用 %s：%s", tc.name, reason)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": f"工具 {tc.name} 调用已拒绝：{reason}，工具未执行。",
+                }
+            )
+
         for index, tc in enumerate(resp.tool_calls):
             args = dict(tc.arguments)
+            identity_args = self.config.inject_for(tc.name)
 
-            # 安全边界：可信身份覆盖 LLM 生成的值
-            for arg_name in self.config.inject_for(tc.name):
+            # 先注入一次，让受信 hook 看到即将执行的身份参数；hook 返回后还会
+            # 再覆盖一次，确保 hook 无法意外或故意改变框架提供的可信身份。
+            for arg_name in identity_args:
                 if args.get(arg_name) not in (None, "", identity):
                     logger.warning(
                         "LLM 给工具 %s 的 %s 传了 %r，已用可信身份 %r 覆盖",
@@ -295,7 +329,35 @@ class BotEngine:
                     )
                 args[arg_name] = identity
 
-            args = await self.hooks.before_tool_call(tc.name, args, ctx)
+            args_error = _tool_arguments_error(args)
+            if args_error is not None:
+                reject_call(index, tc, args, args_error)
+                continue
+
+            try:
+                # 给 hook 独立副本：即使它原地改写后抛异常，也不会留下半成品参数。
+                args = await self.hooks.before_tool_call(
+                    tc.name, dict(args), ctx
+                )
+            except BeforeToolCallRejected:
+                reject_call(index, tc, args, "调用前安全检查失败")
+                continue
+
+            for arg_name in identity_args:
+                if args.get(arg_name) != identity:
+                    logger.warning(
+                        "hook 修改了工具 %s 的受保护身份参数 %s，"
+                        "已重新用可信身份 %r 覆盖",
+                        tc.name,
+                        arg_name,
+                        identity,
+                    )
+                args[arg_name] = identity
+
+            args_error = _tool_arguments_error(args)
+            if args_error is not None:
+                reject_call(index, tc, args, args_error)
+                continue
 
             # 参数被改过就同步回 assistant 消息，让上下文里记录的调用
             # 和实际发出的调用一致。

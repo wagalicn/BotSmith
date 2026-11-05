@@ -485,7 +485,7 @@ def _log_exception_group(eg: BaseException) -> None:
 
 def build_pipeline(config: BotConfig) -> tuple[MessagePipeline, BotEngine]:
     """按配置组装出 pipeline。engine 一并返回，方便调用方收尾时关闭它"""
-    hooks = load_hooks(config.hooks_file)
+    hooks = load_hooks(config.hooks_file, env_values=config.env_values)
     mcp = McpToolClient(config.mcp.servers)
     backend = create_backend(config.llm)
     engine = BotEngine(config, mcp, backend, hooks=hooks)
@@ -516,7 +516,7 @@ async def _start_chat_api(
     logger.info(
         "chat 接口已启动：POST http://0.0.0.0:%d/chat（鉴权：%s）",
         listen_port,
-        "Bearer token" if config.api.token else "无",
+        "Bearer token" if config.api.token else "配置错误：缺少 token",
     )
     return runner
 

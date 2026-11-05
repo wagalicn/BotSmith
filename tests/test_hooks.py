@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import logging
+import os
 import textwrap
 from pathlib import Path
 
 import pytest
 
-from botkit.hooks import HOOK_NAMES, HookContext, HookError, Hooks, load_hooks
+from botkit.hooks import (
+    HOOK_NAMES,
+    BeforeToolCallRejected,
+    HookContext,
+    HookError,
+    Hooks,
+    load_hooks,
+)
 
 
 @pytest.fixture
@@ -241,7 +249,7 @@ async def test_failing_on_message_continues_normal_flow(hooks_file, caplog):
     assert any("on_message" in r.getMessage() for r in caplog.records)
 
 
-async def test_failing_before_tool_call_uses_original_args(hooks_file, caplog):
+async def test_failing_before_tool_call_is_rejected(hooks_file, caplog):
     hooks = load_hooks(
         hooks_file(
             """
@@ -251,7 +259,9 @@ async def test_failing_before_tool_call_uses_original_args(hooks_file, caplog):
         )
     )
     with caplog.at_level(logging.ERROR, logger="botkit.hooks"):
-        assert await hooks.before_tool_call("t", {"a": 1}, ctx()) == {"a": 1}
+        with pytest.raises(BeforeToolCallRejected):
+            await hooks.before_tool_call("t", {"a": 1}, ctx())
+    assert any("拒绝调用工具 t" in r.getMessage() for r in caplog.records)
 
 
 async def test_failing_after_tool_call_uses_original_result(hooks_file, caplog):
@@ -298,7 +308,7 @@ async def test_failing_async_hook_degrades(hooks_file, caplog):
 # --------------------------------------------------------------------------
 
 
-async def test_wrong_return_type_from_before_tool_call(hooks_file, caplog):
+async def test_wrong_return_type_from_before_tool_call_is_rejected(hooks_file, caplog):
     hooks = load_hooks(
         hooks_file(
             """
@@ -308,7 +318,8 @@ async def test_wrong_return_type_from_before_tool_call(hooks_file, caplog):
         )
     )
     with caplog.at_level(logging.ERROR, logger="botkit.hooks"):
-        assert await hooks.before_tool_call("t", {"a": 1}, ctx()) == {"a": 1}
+        with pytest.raises(BeforeToolCallRejected):
+            await hooks.before_tool_call("t", {"a": 1}, ctx())
     assert any("应该返回 dict" in r.getMessage() for r in caplog.records)
 
 
@@ -503,6 +514,46 @@ def test_two_bots_with_same_filename_do_not_collide(tmp_path):
     hooks_b = load_hooks(bot_b / "hooks.py")
     assert hooks_a._impls["before_reply"]("x", None) == "A:x"
     assert hooks_b._impls["before_reply"]("x", None) == "B:x"
+
+
+def test_hook_import_uses_agent_env_and_restores_process_env(
+    hooks_file, monkeypatch
+):
+    monkeypatch.setenv("SHARED_SECRET", "process-value")
+    hooks = load_hooks(
+        hooks_file(
+            """
+            import os
+            CAPTURED = os.environ.get("SHARED_SECRET")
+
+            def before_reply(text, ctx):
+                return CAPTURED + ":" + text
+            """
+        ),
+        env_values={"SHARED_SECRET": "agent-value"},
+    )
+
+    assert hooks._impls["before_reply"]("x", None) == "agent-value:x"
+    assert os.environ["SHARED_SECRET"] == "process-value"
+
+
+def test_hook_import_removes_agent_only_env_after_loading(hooks_file, monkeypatch):
+    monkeypatch.delenv("AGENT_ONLY_SECRET", raising=False)
+    hooks = load_hooks(
+        hooks_file(
+            """
+            import os
+            CAPTURED = os.environ.get("AGENT_ONLY_SECRET")
+
+            def before_reply(text, ctx):
+                return CAPTURED or text
+            """
+        ),
+        env_values={"AGENT_ONLY_SECRET": "agent-only"},
+    )
+
+    assert hooks._impls["before_reply"]("x", None) == "agent-only"
+    assert "AGENT_ONLY_SECRET" not in os.environ
 
 
 # --------------------------------------------------------------------------

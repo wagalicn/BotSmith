@@ -16,7 +16,9 @@ from test_engine import make_config
 from test_runtime import RecordingEngine
 
 
-def _make_agent(name: str, reply: str, token: str = "") -> GatewayAgent:
+def _make_agent(
+    name: str, reply: str, token: str | None = None
+) -> GatewayAgent:
     """造一个可挂载的网关 Agent：真 MessagePipeline + 假引擎。"""
     from botkit.hooks import Hooks
     from botkit.runtime import MessagePipeline
@@ -25,11 +27,18 @@ def _make_agent(name: str, reply: str, token: str = "") -> GatewayAgent:
     cfg = make_config()
     cfg.name = name
     cfg.identity = IdentityConfig(pattern=None)  # 不校验身份，简化 /chat 测试
-    cfg.api = ApiConfig(enabled=True, token=token)
+    cfg.api = ApiConfig(
+        enabled=True,
+        token=token if token is not None else f"{name}-token",
+    )
     engine = RecordingEngine(reply=reply, config=cfg)
     sessions = SessionStore.from_config(cfg.session)
     pipeline = MessagePipeline(cfg, engine, sessions, Hooks())
     return GatewayAgent(name=name, config=cfg, pipeline=pipeline)
+
+
+def _auth(name: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {name}-token"}
 
 
 @pytest.fixture
@@ -51,13 +60,17 @@ async def gateway_client():
 
 async def test_chat_routes_to_correct_agent(gateway_client):
     r1 = await gateway_client.post(
-        "/demand/chat", json={"message": "你好", "user": "u1"}
+        "/demand/chat",
+        json={"message": "你好", "user": "u1"},
+        headers=_auth("demand"),
     )
     assert r1.status == 200
     assert (await r1.json())["reply"] == "我是 demand"
 
     r2 = await gateway_client.post(
-        "/rom/chat", json={"message": "你好", "user": "u1"}
+        "/rom/chat",
+        json={"message": "你好", "user": "u1"},
+        headers=_auth("rom"),
     )
     assert r2.status == 200
     assert (await r2.json())["reply"] == "我是 rom"
@@ -112,25 +125,37 @@ async def test_gateway_health_counts(gateway_client):
 
 async def test_per_agent_auth_isolated():
     agents = [
-        _make_agent("secure", "密", token="sek-1"),
-        _make_agent("open", "开"),  # 不鉴权
+        _make_agent("secure-a", "A", token="sek-a"),
+        _make_agent("secure-b", "B", token="sek-b"),
     ]
     app = build_gateway_app(agents)
     async with TestClient(TestServer(app)) as client:
-        # secure 不带 token → 401
-        r = await client.post("/secure/chat", json={"message": "x", "user": "u1"})
+        # 不带 token → 401
+        r = await client.post(
+            "/secure-a/chat", json={"message": "x", "user": "u1"}
+        )
         assert r.status == 401
 
-        # secure 带正确 token → 200
+        # 各自 token 只能访问所属 Agent
         r = await client.post(
-            "/secure/chat",
+            "/secure-a/chat",
             json={"message": "x", "user": "u1"},
-            headers={"Authorization": "Bearer sek-1"},
+            headers={"Authorization": "Bearer sek-a"},
         )
         assert r.status == 200
 
-        # open 不需要 token → 200
-        r = await client.post("/open/chat", json={"message": "x", "user": "u1"})
+        r = await client.post(
+            "/secure-b/chat",
+            json={"message": "x", "user": "u1"},
+            headers={"Authorization": "Bearer sek-a"},
+        )
+        assert r.status == 401
+
+        r = await client.post(
+            "/secure-b/chat",
+            json={"message": "x", "user": "u1"},
+            headers={"Authorization": "Bearer sek-b"},
+        )
         assert r.status == 200
 
 

@@ -12,14 +12,22 @@ import json
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from botkit.api_server import create_api_app
+from botkit.api_server import (
+    MAX_MESSAGE_CHARS,
+    MAX_SESSION_ID_CHARS,
+    MAX_USER_CHARS,
+    create_api_app,
+)
 from botkit.config import ApiConfig, IdentityConfig
 
 from test_engine import make_config
 from test_runtime import RecordingEngine
 
 
-def _make_app(reply="你好呀", token="", raises=None):
+AUTH = {"Authorization": "Bearer test-token"}
+
+
+def _make_app(reply="你好呀", token="test-token", raises=None, hooks=None):
     from botkit.hooks import Hooks
     from botkit.runtime import MessagePipeline
     from botkit.session import SessionStore
@@ -30,8 +38,9 @@ def _make_app(reply="你好呀", token="", raises=None):
     cfg.api = ApiConfig(enabled=True, token=token)
     engine = RecordingEngine(reply=reply, raises=raises, config=cfg)
     sessions = SessionStore.from_config(cfg.session)
-    pipeline = MessagePipeline(cfg, engine, sessions, Hooks())
-    return create_api_app(cfg, pipeline, hooks=Hooks())
+    active_hooks = hooks if hooks is not None else Hooks()
+    pipeline = MessagePipeline(cfg, engine, sessions, active_hooks)
+    return create_api_app(cfg, pipeline, hooks=active_hooks)
 
 
 @pytest.fixture
@@ -66,7 +75,7 @@ async def test_sse_streams_tokens_and_done(client):
     resp = await client.post(
         "/chat",
         json={"message": "hi", "user": "u1", "session_id": "s1"},
-        headers={"Accept": "text/event-stream"},
+        headers={"Accept": "text/event-stream", **AUTH},
     )
     assert resp.status == 200
     assert "text/event-stream" in resp.headers["Content-Type"]
@@ -89,7 +98,7 @@ async def test_sse_progress_event(client):
     resp = await client.post(
         "/chat",
         json={"message": "hi", "user": "u1"},
-        headers={"Accept": "text/event-stream"},
+        headers={"Accept": "text/event-stream", **AUTH},
     )
     events = _parse_sse(await resp.text())
     progress = [d["text"] for ev, d in events if ev == "progress"]
@@ -104,7 +113,7 @@ async def test_sse_error_event_on_engine_failure():
         resp = await c.post(
             "/chat",
             json={"message": "hi", "user": "u1"},
-            headers={"Accept": "text/event-stream"},
+            headers={"Accept": "text/event-stream", **AUTH},
         )
         # SSE 一旦开流就是 200，错误通过 error 事件告知
         assert resp.status == 200
@@ -121,7 +130,9 @@ async def test_sse_error_event_on_engine_failure():
 
 async def test_non_sse_still_returns_json(client):
     resp = await client.post(
-        "/chat", json={"message": "hi", "user": "u1", "session_id": "s1"}
+        "/chat",
+        json={"message": "hi", "user": "u1", "session_id": "s1"},
+        headers=AUTH,
     )
     assert resp.status == 200
     assert resp.headers["Content-Type"].startswith("application/json")
@@ -150,6 +161,116 @@ async def test_sse_missing_message_still_400():
         resp = await c.post(
             "/chat",
             json={"user": "u1"},
-            headers={"Accept": "text/event-stream"},
+            headers={"Accept": "text/event-stream", **AUTH},
         )
         assert resp.status == 400
+
+
+# --------------------------------------------------------------------------
+# API 安全边界
+# --------------------------------------------------------------------------
+
+
+def test_create_api_app_rejects_empty_token():
+    with pytest.raises(ValueError, match=r"api\.token"):
+        _make_app(token="")
+
+
+async def test_health_is_the_only_unauthenticated_agent_route():
+    app = _make_app()
+    async with TestClient(TestServer(app)) as c:
+        health = await c.get("/health")
+        assert health.status == 200
+
+        chat = await c.post("/chat", json={"message": "hi", "user": "u1"})
+        assert chat.status == 401
+
+
+async def test_custom_routes_use_shared_auth_middleware():
+    from aiohttp import web
+    from botkit.hooks import Hooks
+
+    def register_routes(app, config, pipeline):
+        async def private(request):
+            return web.json_response({"ok": True})
+
+        app.router.add_get("/private", private)
+
+    app = _make_app(hooks=Hooks(register_routes=register_routes))
+    async with TestClient(TestServer(app)) as c:
+        denied = await c.get("/private")
+        assert denied.status == 401
+
+        allowed = await c.get("/private", headers=AUTH)
+        assert allowed.status == 200
+        assert await allowed.json() == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("message", {"not": "text"}),
+        ("user", 123),
+        ("session_id", ["not", "text"]),
+    ],
+)
+async def test_chat_rejects_non_string_fields(field, bad_value):
+    payload = {"message": "hi", "user": "u1", "session_id": "s1"}
+    payload[field] = bad_value
+    app = _make_app()
+    async with TestClient(TestServer(app)) as c:
+        response = await c.post("/chat", json=payload, headers=AUTH)
+        assert response.status == 400
+        assert field in (await response.json())["error"]
+
+
+@pytest.mark.parametrize(
+    "field,limit",
+    [
+        ("message", MAX_MESSAGE_CHARS),
+        ("user", MAX_USER_CHARS),
+        ("session_id", MAX_SESSION_ID_CHARS),
+    ],
+)
+async def test_chat_rejects_oversized_fields(field, limit):
+    payload = {"message": "hi", "user": "u1", "session_id": "s1"}
+    payload[field] = "x" * (limit + 1)
+    app = _make_app()
+    async with TestClient(TestServer(app)) as c:
+        response = await c.post("/chat", json=payload, headers=AUTH)
+        assert response.status == 413
+        assert field in (await response.json())["error"]
+
+
+async def test_agent_api_rejects_body_over_one_mebibyte():
+    app = _make_app()
+    body = '{"message":"' + ("x" * (1024 * 1024)) + '","user":"u1"}'
+    async with TestClient(TestServer(app)) as c:
+        response = await c.post(
+            "/chat",
+            data=body.encode("utf-8"),
+            headers={"Content-Type": "application/json", **AUTH},
+        )
+        assert response.status == 413
+
+
+async def test_authentication_uses_constant_time_compare(monkeypatch):
+    import botkit.api_server as api_server
+
+    seen = []
+
+    def compare(left, right):
+        seen.append((left, right))
+        return left == right
+
+    monkeypatch.setattr(api_server.hmac, "compare_digest", compare)
+    app = _make_app()
+    async with TestClient(TestServer(app)) as c:
+        response = await c.post(
+            "/chat",
+            json={"message": "hi", "user": "u1"},
+            headers=AUTH,
+        )
+
+    assert response.status == 200
+    assert seen == [(b"Bearer test-token", b"Bearer test-token")]

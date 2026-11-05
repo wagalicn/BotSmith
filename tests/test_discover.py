@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -122,3 +123,60 @@ def test_ignores_non_bot_dirs_and_files(tmp_path, base_env):
 def test_nonexistent_directory_raises(tmp_path):
     with pytest.raises(ConfigError):
         discover_api_bots(tmp_path / "does-not-exist")
+
+
+# --------------------------------------------------------------------------
+# 多 Agent .env 隔离
+# --------------------------------------------------------------------------
+
+
+def _isolated_env_yaml(name: str) -> str:
+    return f"""\
+name: {name}
+
+api:
+  enabled: true
+  token: ${{CHAT_API_TOKEN}}
+
+llm:
+  api_url: ${{LLM_API_URL}}
+  api_key: ${{LLM_API_KEY}}
+  model: ${{LLM_MODEL}}
+
+prompt:
+  file: prompt.md
+"""
+
+
+def test_each_discovered_bot_uses_its_own_dotenv(tmp_path, monkeypatch):
+    for var in ("CHAT_API_TOKEN", "LLM_API_URL", "LLM_API_KEY", "LLM_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+
+    first = _write_bot(tmp_path, "alpha", _isolated_env_yaml("alpha"))
+    second = _write_bot(tmp_path, "beta", _isolated_env_yaml("beta"))
+    (first / ".env").write_text(
+        "CHAT_API_TOKEN=alpha-token\n"
+        "LLM_API_URL=https://alpha.invalid/v1\n"
+        "LLM_API_KEY=alpha-key\n"
+        "LLM_MODEL=alpha-model\n",
+        encoding="utf-8",
+    )
+    (second / ".env").write_text(
+        "CHAT_API_TOKEN=beta-token\n"
+        "LLM_API_URL=https://beta.invalid/v1\n"
+        "LLM_API_KEY=beta-key\n"
+        "LLM_MODEL=beta-model\n",
+        encoding="utf-8",
+    )
+
+    found = {item.name: item.config for item in discover_api_bots(tmp_path)}
+
+    assert found["alpha"] is not None and found["beta"] is not None
+    assert found["alpha"].api.token == "alpha-token"
+    assert found["beta"].api.token == "beta-token"
+    assert found["alpha"].llm.api_key == "alpha-key"
+    assert found["beta"].llm.api_key == "beta-key"
+    assert found["alpha"].env_value("LLM_MODEL") == "alpha-model"
+    assert found["beta"].env_value("LLM_MODEL") == "beta-model"
+    assert "CHAT_API_TOKEN" not in os.environ
+    assert "LLM_API_KEY" not in os.environ
