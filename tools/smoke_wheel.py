@@ -222,7 +222,21 @@ def smoke(wheel: Path) -> int:
     return 0
 
 
+def use_utf8_output() -> None:
+    """
+    把本进程的 stdout / stderr 改成 UTF-8。
+
+    输出被重定向时（比如 CI 的日志），Windows 上的 Python 用系统代码页编码（美区是 cp1252），
+    脚本里的中文会触发 UnicodeEncodeError。子进程已经在 clean_env() 里统一成 UTF-8，这里补上本进程。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    use_utf8_output()
     parser = argparse.ArgumentParser(description="在干净虚拟环境里安装 wheel 并做冒烟测试")
     parser.add_argument("wheel", type=Path, help=".whl 文件，或只含一个 .whl 的目录")
     args = parser.parse_args()
