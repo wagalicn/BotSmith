@@ -5,7 +5,7 @@
 用配置快速搭一个 Agent，并通过 HTTP 接口对外使用。业务定制集中在两个文件，
 **不需要改 Python 代码**：
 
-- `bot.yaml` —— LLM、MCP 工具、身份规则、会话策略、文案、对外接口
+- `bot.yaml` —— LLM、MCP 工具、身份规则、会话策略、文案、对外接口、Agent 名片
 - `prompt.md` —— 这个 Agent 是谁、要做什么
 
 搭好的 Agent 可以：
@@ -13,6 +13,9 @@
 - **开成 HTTP 接口**（`POST /chat`）供 Dify、自研门户或任何第三方调用 —— 这是主要用法
 - **接入企业微信**（长连接），直接在群里 @ 它对话 —— 另一种接入方式
 - 两者可以**同时开**，也可以只开其中一个
+
+**方向**：在这套快速搭建 API Agent 的能力上，再提供企业级门户来管理这些 Agent，
+并让 Agent 之间能互相发现、联合调用。现在做到哪一步、接下来做什么，见 [TODO.md](TODO.md)。
 
 **可视化配置**（推荐，尤其是给不熟命令行的同事）：
 
@@ -47,6 +50,7 @@ python -m botkit run bots/hr-assistant         # 连企微；若开了对外接�
 |---|---|
 | **第一次建 Agent** | [新建 Agent 步骤说明书](docs/新建Bot步骤说明书.md) —— 10 步，主线用配置页面，每步带预期结果和卡住了怎么办 |
 | **查某个字段怎么配** | [配置参考](docs/配置参考.md) —— `bot.yaml` 全字段、hook、三个后端、处理流程 |
+| **现在做到哪了、接下来做什么** | [TODO.md](TODO.md) —— 路线、已完成的、待确认的设计 |
 | 这个项目是怎么回事 | 本文件 |
 
 ---
@@ -70,6 +74,7 @@ Body:    {"message": "用户说的话", "user": "L220104", "session_id": "conv-1
 Resp:    {"reply": "Agent回复", "kind": "llm", "session_id": "conv-1"}
 
 GET  http://<服务器IP>:<port>/health         # 探活，免鉴权
+GET  http://<服务器IP>:<port>/.well-known/agent-card.json   # Agent 名片，要鉴权
 ```
 
 - **`user` / `session_id` 由调用方提供**：门户/Dify 传当前用户和会话 ID。
@@ -79,6 +84,13 @@ GET  http://<服务器IP>:<port>/health         # 探活，免鉴权
   MCP 服务端仍须校验最终用户权限。配置页面继续只允许本机访问。
 
 字段和 Dify 对接细节见 [配置参考的 api 段](docs/配置参考.md#api-对外接口)。
+
+**让别人知道这个 Agent 是做什么的**：在 `bot.yaml` 的 `card` 段写一句话简介和技能说明，
+别的系统（门户、其他 Agent）带 token 访问上面的名片地址，就能了解它。
+字段和命名参考 [A2A 1.0](https://a2a-protocol.org/latest/specification/) 的 Agent Card，
+**还不兼容 A2A**。多 Agent 网关里的路径是 `/<agent>/.well-known/agent-card.json`；
+网关的 `GET /agents` 仍然免鉴权，只列名字和状态，不含简介。
+详见[配置参考的 card 段](docs/配置参考.md#card-agent-名片)。
 
 **需要 `/chat` 之外的专属端点？** Agent 可以在自己的 `hooks.py` 里实现
 `register_routes`，把自定义 HTTP 路由（结构化分析、批量导入等）挂到同一个服务上，
@@ -116,6 +128,8 @@ GET  http://<服务器IP>:<port>/health         # 探活，免鉴权
 - **token 用量**：每轮对话结束记一行累计 token（带工具调用时会多次请求 LLM，
   打的是本轮总量）。端点不返回用量就不打，不污染日志
 - **对外 chat 接口**：一条 `POST /chat` 把 Agent 暴露给 Dify / 内部门户 / 任何第三方
+- **Agent 名片**：`card` 段写简介和技能说明，`GET /.well-known/agent-card.json` 对外介绍自己
+  （要鉴权，字段参考 A2A）。门户做 Agent 目录、别的 Agent 想找人帮忙，都先看它
 - **自定义 HTTP 端点**：某个 Agent 需要 `/chat` 之外的专属端点时，通过 `register_routes`
   扩展点挂上，不改骨架。**这项需要写 Python 代码**（区别于纯配置就能改的对话/工具/文案），
   详见[配置参考](docs/配置参考.md#挂-agent-自己的自定义路由register_routes)
@@ -142,8 +156,8 @@ GET  http://<服务器IP>:<port>/health         # 探活，免鉴权
 **对接 Dify**：在 Dify 里用「自定义工具 / HTTP 请求」节点指向这个 `/chat`，
 把 Dify 的当前用户传给 `user`、conversation_id 传给 `session_id`。
 
-> 多 Agent 网关和 SSE 已实现；门户、Redis 与工程化工作的当前状态见
-> [TODO.md](TODO.md)。
+> 多 Agent 网关、SSE 和 Agent 名片已实现；门户、Agent 之间互相调用、Redis 与工程化工作的
+> 当前状态见 [TODO.md](TODO.md)。
 
 ---
 
@@ -165,7 +179,7 @@ bot-demo/
 ├── start_ui.py               # 上面脚本共用的启动逻辑
 ├── README.md
 ├── README.en.md              # English version
-├── TODO.md                   # 当前状态与后续阶段索引
+├── TODO.md                   # 当前状态与后续计划
 ├── docs/
 │   ├── 新建Bot步骤说明书.md
 │   └── 配置参考.md
@@ -182,7 +196,11 @@ bot-demo/
 │   ├── session.py            # 多轮上下文
 │   ├── hooks.py              # 扩展点加载
 │   ├── runtime.py            # 消息流程 + 企微长连接 + chat 接口并存
-│   ├── api_server.py         # 对外 chat HTTP 接口（POST /chat, GET /health）
+│   ├── api_server.py         # 对外 chat HTTP 接口（POST /chat, GET /health, GET /.well-known/agent-card.json）
+│   ├── agent_card.py         # Agent 名片：按配置生成对外的自我介绍
+│   ├── prompt_check.py       # 提示词结构检查（给页面提个醒，不是硬错误）
+│   ├── usage.py              # 用量落盘（按月一个 jsonl，配置页「用量」页读它）
+│   ├── portal/               # 门户的认证原语（用户表、账号密码、令牌签名），还没有登录接口和页面
 │   ├── scaffold.py           # 骨架生成
 │   ├── logging_setup.py
 │   ├── ui/                   # 可视化配置页面

@@ -5,7 +5,7 @@
 Build an Agent through configuration and use it externally over an HTTP API.
 Business customization lives in just two files, with **no need to touch Python code**:
 
-- `bot.yaml` —— LLM, MCP tools, identity rules, session policy, message copy, external API
+- `bot.yaml` —— LLM, MCP tools, identity rules, session policy, message copy, external API, Agent card
 - `prompt.md` —— who this Agent is and what it should do
 
 An Agent you build can:
@@ -13,6 +13,9 @@ An Agent you build can:
 - **Be exposed as an HTTP API** (`POST /chat`) for Dify, an in-house portal, or any third party —— this is the primary use
 - **Connect to WeCom (WeChat Work)** via a long connection, so you can @ it in a group —— another way to plug in
 - Enable **both at once**, or just one of them
+
+**Direction**: on top of this quick way to build API Agents, provide an enterprise portal to manage those Agents,
+and let Agents discover and call each other jointly. What is done and what comes next is in [TODO.md](TODO.md).
 
 **Visual configuration** (recommended, especially for colleagues not comfortable with the command line):
 
@@ -47,6 +50,7 @@ and files edited by hand still open fine in the page.
 |---|---|
 | **Building an Agent for the first time** | [Guide: Creating a New Agent](docs/creating-a-new-agent.md) —— 10 steps, mainly via the config page, each with expected results and troubleshooting |
 | **How to configure a specific field** | [Configuration Reference](docs/configuration-reference.md) —— all `bot.yaml` fields, hooks, the three backends, processing pipeline |
+| **Where the project stands and what's next** | [TODO.md](TODO.md) —— roadmap, what's done, designs still to confirm |
 | What this project is about | This file |
 
 ---
@@ -70,6 +74,7 @@ Body:    {"message": "what the user said", "user": "L220104", "session_id": "con
 Resp:    {"reply": "Agent reply", "kind": "llm", "session_id": "conv-1"}
 
 GET  http://<server IP>:<port>/health         # liveness check, no auth
+GET  http://<server IP>:<port>/.well-known/agent-card.json   # Agent card, auth required
 ```
 
 - **`user` / `session_id` are provided by the caller**: the portal or Dify supplies the current user and session ID.
@@ -79,6 +84,13 @@ GET  http://<server IP>:<port>/health         # liveness check, no auth
   MCP servers must still enforce end-user authorization. The config page remains local-only.
 
 See the [api section in the Configuration Reference](docs/configuration-reference.md#api--external-api) for fields and Dify integration details.
+
+**Let others know what this Agent does**: write a one-line description and skill descriptions in the `card` section
+of `bot.yaml`; other systems (a portal, other Agents) fetch the card address above with the token to learn about it.
+Field names follow the Agent Card of [A2A 1.0](https://a2a-protocol.org/latest/specification/);
+it is **not A2A-compatible yet**. Behind the multi-Agent gateway the path is `/<agent>/.well-known/agent-card.json`;
+the gateway's `GET /agents` stays unauthenticated and lists only names and status, no descriptions.
+See the [card section in the Configuration Reference](docs/configuration-reference.md#card--agent-card).
 
 **Need a dedicated endpoint beyond `/chat`?** An Agent can implement `register_routes` in its own `hooks.py`
 to attach custom HTTP routes (structured analysis, bulk import, etc.) to the same service, without changing the skeleton.
@@ -117,6 +129,8 @@ Built in, so you don't have to worry about it:
   the LLM several times, so the figure is the per-turn total). Nothing is logged when the endpoint
   doesn't report usage, keeping the log clean
 - **External chat API**: a single `POST /chat` exposes the Agent to Dify / an internal portal / any third party
+- **Agent card**: the `card` section holds a description and skill descriptions, served at `GET /.well-known/agent-card.json`
+  (auth required, fields follow A2A). A portal building a directory, or another Agent looking for help, reads it first
 - **Custom HTTP endpoints**: when an Agent needs a dedicated endpoint beyond `/chat`, attach it via the `register_routes`
   extension point without changing the skeleton. **This one requires Python code** (unlike the dialog/tools/copy that are pure config),
   see the [Configuration Reference](docs/configuration-reference.md#attaching-an-agents-own-custom-routes-register_routes)
@@ -143,8 +157,8 @@ or configure the `api` section directly in `bot.yaml`. Validation fails if the A
 **Integrating with Dify**: in Dify, use a "custom tool / HTTP request" node pointing at this `/chat`,
 passing Dify's current user as `user` and the conversation_id as `session_id`.
 
-> The multi-Agent gateway and SSE are implemented. See [TODO.md](TODO.md)
-> for the current status of the portal, Redis, and engineering work.
+> The multi-Agent gateway, SSE, and the Agent card are implemented. See [TODO.md](TODO.md)
+> for the current status of the portal, Agents calling each other, Redis, and engineering work.
 
 ---
 
@@ -166,7 +180,7 @@ bot-demo/
 ├── start_ui.py               # shared startup logic for the scripts above
 ├── README.md
 ├── README.en.md              # English version
-├── TODO.md                   # current status and index of upcoming phases
+├── TODO.md                   # current status and what comes next
 ├── docs/
 │   ├── 新建Bot步骤说明书.md
 │   └── 配置参考.md
@@ -183,7 +197,11 @@ bot-demo/
 │   ├── session.py            # multi-turn context
 │   ├── hooks.py              # extension point loading
 │   ├── runtime.py            # message pipeline + WeCom long connection + chat API coexistence
-│   ├── api_server.py         # external chat HTTP API (POST /chat, GET /health)
+│   ├── api_server.py         # external chat HTTP API (POST /chat, GET /health, GET /.well-known/agent-card.json)
+│   ├── agent_card.py         # Agent card: builds the Agent's outward-facing self-introduction from config
+│   ├── prompt_check.py       # prompt structure check (hints on the page, not hard errors)
+│   ├── usage.py              # usage recording (one jsonl per month, read by the page's "Usage" tab)
+│   ├── portal/               # portal auth primitives (user store, password login, token signing); no login API or pages yet
 │   ├── scaffold.py           # skeleton generation
 │   ├── logging_setup.py
 │   ├── ui/                   # the visual config page
