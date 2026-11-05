@@ -16,6 +16,7 @@ When something is misconfigured, `python -m botkit validate <bot dir>` points ou
 - [name](#name)
 - [wecom — WeCom credentials](#wecom--wecom-credentials)
 - [api — external API](#api--external-api)
+- [card — Agent card](#card--agent-card)
 - [llm — the model](#llm--the-model)
 - [prompt](#prompt)
 - [mcp — tool sources](#mcp--tool-sources)
@@ -39,6 +40,9 @@ When something is misconfigured, `python -m botkit validate <bot dir>` points ou
 | `api.enabled` | no | `false` | Enable the external chat API (POST /chat) |
 | `api.port` | no | `9000` | Port the chat API listens on |
 | `api.token` | yes when API is enabled | — | Chat API auth token; must be non-empty |
+| `card.description` | no | empty | Agent card: one line on what this Agent does |
+| `card.version` | no | `1.0.0` | Card version; must be a string (quote it) |
+| `card.skills[]` | no | `[]` | Skill descriptions on the card: `name` and `description` required; `id`, `tags`, `examples` optional |
 | `llm.client` | no | `openai` | LLM backend, `openai` / `aiohttp` / `anthropic` |
 | `llm.api_url` | yes | — | LLM endpoint, written differently per backend |
 | `llm.api_key` | yes | — | LLM key |
@@ -157,6 +161,7 @@ Body:    {"message": "what the user said", "user": "L220104", "session_id": "con
 Resp:    {"reply": "Agent reply", "kind": "llm", "session_id": "conv-1"}
 
 GET  http://<server IP>:<port>/health         # liveness check, no auth
+GET  http://<server IP>:<port>/.well-known/agent-card.json   # Agent card, auth required (see the card section below)
 ```
 
 Input limits: 1 MiB per request body, 100,000 characters for `message`, and 256 characters
@@ -265,6 +270,97 @@ Once the Agent starts, `/echo` is mounted on the same port as `/chat` and `/heal
    `load_hooks → create_api_app` mounting chain.
 5. Run `python -m botkit validate bots/<bot>` to confirm hooks load fine.
 6. Document the endpoint contract in `bots/<bot>/README.md`.
+
+---
+
+## card — Agent card
+
+```yaml
+card:
+  description: "Looks up and handles IT tickets, answers common IT questions."
+  version: "1.0.0"
+  skills:
+    - id: ticket-query
+      name: Ticket lookup
+      description: Look up a ticket's status and progress by ticket number or requester
+      tags: [ticket, IT]
+      examples:
+        - "What's the progress of ticket T20260001?"
+```
+
+**Optional; the whole section can be omitted.** The card is the Agent's self-introduction: what it does and what it
+is good at. A portal building an Agent directory, or another Agent looking for help, reads this card first. Field
+names follow the [A2A protocol 1.0 AgentCard](https://a2a-protocol.org/latest/specification/), so they can be reused
+when you later connect to Agents from other systems.
+
+| Field | Default | Description |
+|---|---|---|
+| `description` | empty | One line on what this Agent does. When empty, the config summary printed by `validate` says so |
+| `version` | `1.0.0` | Card version. **Must be a string**, so quote it (in YAML `1.0` is a number, and `1.10` becomes `1.1`) |
+| `skills` | none | List of skill descriptions, see below |
+
+Each item of `skills`:
+
+| Field | Required | Description |
+|---|:---:|---|
+| `name` | yes | Skill name |
+| `description` | yes | What the skill can do and which questions it fits |
+| `id` | no | Skill identifier. Starts with a letter or digit, only letters, digits, `-`, `_`, `.`, up to 64 characters; must be unique within one Agent. When omitted it is filled in order as `skill-1`, `skill-2`, ... |
+| `tags` | no | List of keywords |
+| `examples` | no | List of example questions |
+
+> **This `skills` is not the top-level `skills`.** The top-level `skills` splices the supplementary documents under
+> `bots/_skills/` into the prompt to help the model understand the business; `card.skills` is only an outward-facing
+> description of abilities, it **never** goes into the prompt and does not change how the model answers.
+
+**How to fetch the card**:
+
+```
+GET http://<IP>:<port>/.well-known/agent-card.json              # single Agent
+GET http://<IP>:<port>/<agent>/.well-known/agent-card.json      # multi-Agent gateway
+Header:  Authorization: Bearer <token>                          # required, same as /chat
+```
+
+- **Authentication is required.** The description and skills may touch internal business, so, like `/chat`, the
+  request must carry that Agent's own token. The gateway's `GET /agents` stays unauthenticated and only shows names
+  and status; it does **not** include descriptions or skills.
+- The card is served by the HTTP API, so only Agents with `api` enabled have one.
+- After changing the card in `bot.yaml`, restart for it to take effect.
+- The config page cannot edit the card yet, but saving other settings in the page keeps a hand-written card as is.
+- The conversation endpoint address in the card (`supportedInterfaces[0].url`) is derived from the protocol, host
+  and gateway prefix of the incoming request. Behind a reverse proxy, the protocol and host there may differ from the
+  ones the caller sees.
+
+**Relation to A2A**: only the card is aligned for now, and the framework is **not A2A-compatible yet** because it does
+not implement A2A's messaging operations. The card's `supportedInterfaces` lists only the framework's own conversation
+endpoint (`POST /chat`) under a custom binding name `botkit-http`; an A2A client skips bindings it does not recognize.
+
+Example response:
+
+```json
+{
+  "name": "it-help",
+  "description": "Looks up and handles IT tickets, answers common IT questions.",
+  "version": "1.0.0",
+  "supportedInterfaces": [
+    {"url": "http://10.0.0.5:9100/it-help/chat", "protocolBinding": "botkit-http", "protocolVersion": "1"}
+  ],
+  "capabilities": {"streaming": true, "pushNotifications": false, "extendedAgentCard": false},
+  "securitySchemes": {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}},
+  "securityRequirements": [{"schemes": {"bearer": {"list": []}}}],
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "ticket-query",
+      "name": "Ticket lookup",
+      "description": "Look up a ticket's status and progress by ticket number or requester",
+      "tags": ["ticket", "IT"],
+      "examples": ["What's the progress of ticket T20260001?"]
+    }
+  ]
+}
+```
 
 ---
 

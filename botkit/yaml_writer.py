@@ -164,6 +164,55 @@ def _dump_api(values: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _dump_card(values: dict[str, Any]) -> list[str]:
+    """
+    Agent 名片段。整段可省略 = 用默认值，只有配了才写，别给旧 bot 平添空段。
+
+    页面目前没有编辑名片的表单，但保存时整份配置会回传到这里，不写出来的话
+    手写在 bot.yaml 里的名片会在页面保存后悄悄丢掉。所以按原有的键原样写回。
+    """
+    card = values.get("card")
+    if not isinstance(card, dict) or not card:
+        return []
+
+    body: list[str] = []
+    if "description" in card:
+        body.extend(_kv("description", card.get("description"), 2))
+    if "version" in card:
+        body.extend(_kv("version", card.get("version"), 2))
+    skills = card.get("skills")
+    if isinstance(skills, list):
+        if not skills:
+            body.append("  skills: []")
+        else:
+            body.append("  skills:")
+            for skill in skills:
+                if not isinstance(skill, dict):
+                    continue
+                # 列表项用单独的 "-" 起头，项内的键统一 8 缩进，
+                # 这样多行 description 的块标量缩进不会和列表项对不上。
+                body.append("    -")
+                for key in ("id", "name", "description"):
+                    if key in skill:
+                        body.extend(_kv(key, skill.get(key), 8))
+                for key in ("tags", "examples"):
+                    if key in skill:
+                        items = [str(x) for x in (skill.get(key) or [])]
+                        body.extend(_str_list(key, items, 8))
+    if not body:
+        return []
+
+    lines = _section(
+        "Agent 名片",
+        "Agent 的自我介绍，门户做 Agent 目录、别的 Agent 找人帮忙时看的就是它。\n"
+        "通过 GET /.well-known/agent-card.json 获取（和 /chat 一样要 token），改完需重启。\n"
+        "这里的 skills 是技能说明，和顶层 skills（拼进提示词的补充文档）不是一回事。",
+    )
+    lines.append("card:")
+    lines.extend(body)
+    return lines
+
+
 def _dump_llm(values: dict[str, Any]) -> list[str]:
     llm = _section_dict(values, "llm")
     client = _get(llm, "client", "openai")
@@ -432,6 +481,7 @@ def dump_bot_yaml(values: dict[str, Any], *, generated_note: bool = True) -> str
     for dump in (
         _dump_wecom,
         _dump_api,
+        _dump_card,
         _dump_llm,
         _dump_prompt,
         _dump_skills,

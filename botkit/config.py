@@ -71,6 +71,7 @@ _TOP_LEVEL_KEYS = {
     "name",
     "wecom",
     "api",
+    "card",
     "llm",
     "prompt",
     "skills",
@@ -108,6 +109,34 @@ class ApiConfig:
     port: int = 9000
     # 请求头 Authorization: Bearer <token> 的校验值。API 启用时必须配置。
     token: str = ""
+
+
+@dataclass
+class CardSkill:
+    """Agent 名片里的一项技能说明。字段对应 A2A 协议的 AgentSkill。"""
+
+    id: str
+    name: str
+    description: str
+    tags: list[str] = field(default_factory=list)
+    examples: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CardConfig:
+    """
+    Agent 名片（Agent Card）里由作者填写的部分，整段可省略。
+
+    名片是 Agent 的自我介绍：做什么、擅长什么、怎么调用。字段参考 A2A 协议的
+    AgentCard，将来要和其他系统的 Agent 互联时可以直接沿用。
+
+    注意：这里的 skills 是对外介绍的「技能说明」，和顶层 skills（把补充文档
+    拼进提示词）是两回事。
+    """
+
+    description: str = ""
+    version: str = "1.0.0"
+    skills: list[CardSkill] = field(default_factory=list)
 
 
 @dataclass
@@ -244,6 +273,8 @@ class BotConfig:
     skills_text: str = ""
     # 对外 chat HTTP 接口
     api: ApiConfig = field(default_factory=ApiConfig)
+    # Agent 名片（自我介绍）。GET /.well-known/agent-card.json 据此生成。
+    card: CardConfig = field(default_factory=CardConfig)
     # 本 Agent 的 .env 快照。不会写入 repr，避免调试输出泄露密钥。
     # 多 Agent 模式下 hook 应通过 env_value() 读取，不能依赖全局 os.environ。
     env_values: dict[str, str] = field(default_factory=dict, repr=False)
@@ -500,6 +531,78 @@ def _parse_api(raw: Any) -> ApiConfig:
             "CHAT_API_TOKEN in .env and use ${CHAT_API_TOKEN} in bot.yaml",
         ))
     return ApiConfig(enabled=enabled, port=port, token=token)
+
+
+# 名片技能的 id：字母或数字开头，只含字母、数字、-、_、.，最长 64 个字符。
+# 先收紧，将来要放宽很容易，收紧就会让已有配置失效。
+_CARD_SKILL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def _parse_card_skills(raw: Any) -> list[CardSkill]:
+    """名片里的技能说明列表。id 省略时按顺序补成 skill-1、skill-2……"""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(_m(
+            f"card.skills 应该是列表，当前是 {type(raw).__name__}",
+            f"card.skills should be a list, but is {type(raw).__name__}",
+        ))
+
+    skills: list[CardSkill] = []
+    seen: set[str] = set()
+    for i, item in enumerate(raw):
+        path = f"card.skills[{i}]"
+        data = _as_dict(item, path)
+        _reject_unknown(data, {"id", "name", "description", "tags", "examples"}, path)
+        name = _require_str(data, "name", path)
+        description = _require_str(data, "description", path)
+        skill_id = _opt_str(data, "id", path, None) or f"skill-{i + 1}"
+        if not _CARD_SKILL_ID.fullmatch(skill_id):
+            raise ConfigError(_m(
+                f"{path}.id 只能包含字母、数字、-、_、.，以字母或数字开头，"
+                f"最长 64 个字符，当前是 {skill_id!r}",
+                f"{path}.id may only contain letters, digits, -, _ and ., must start with "
+                f"a letter or digit and be at most 64 characters, but is {skill_id!r}",
+            ))
+        if skill_id in seen:
+            raise ConfigError(_m(
+                f"{path}.id 重复了：{skill_id!r}。同一个 Agent 里每项技能的 id 必须不同",
+                f"{path}.id is duplicated: {skill_id!r}. Each skill of one Agent needs a distinct id",
+            ))
+        seen.add(skill_id)
+        skills.append(CardSkill(
+            id=skill_id,
+            name=name,
+            description=description,
+            tags=_opt_str_list(data, "tags", path),
+            examples=_opt_str_list(data, "examples", path),
+        ))
+    return skills
+
+
+def _parse_card(raw: Any) -> CardConfig:
+    """Agent 名片。整段可省略，省略时简介为空、版本 1.0.0、没有技能说明。"""
+    data = _as_dict(raw, "card")
+    if not data:
+        return CardConfig()
+    _reject_unknown(data, {"description", "version", "skills"}, "card")
+
+    defaults = CardConfig()
+    version = data.get("version")
+    if version is not None and not isinstance(version, str):
+        # YAML 里 1.0 是浮点数、1.10 会变成 1.1，必须提醒用户加引号，不能悄悄转成字符串
+        raise ConfigError(_m(
+            f"card.version 应该是字符串，当前是 {type(version).__name__}。版本号请加引号，"
+            f'例如 version: "1.0"',
+            f"card.version should be a string, but is {type(version).__name__}. "
+            f'Quote the version number, e.g. version: "1.0"',
+        ))
+
+    return CardConfig(
+        description=_opt_str(data, "description", "card", "") or "",
+        version=_opt_str(data, "version", "card", defaults.version) or defaults.version,
+        skills=_parse_card_skills(data.get("skills")),
+    )
 
 
 def _parse_llm(raw: Any) -> LlmConfig:
@@ -1134,6 +1237,7 @@ def load_bot_config(bot_dir: str | Path, *, load_env: bool = True) -> BotConfig:
         skills_files=skills_files,
         skills_text=skills_text,
         api=api,
+        card=_parse_card(raw.get("card")),
         env_values=bot_env,
     )
 
@@ -1362,6 +1466,17 @@ def config_summary(cfg: BotConfig) -> str:
     else:
         lines.append("  chat 接口      : 未开启")
     lines.append("")
+    lines.append("[名片]")
+    if cfg.card.description:
+        lines.append(f"  简介           : {cfg.card.description.splitlines()[0][:60]}")
+    else:
+        lines.append("  简介           : (未填写，建议在 card.description 里用一句话说明这个 Agent 做什么)")
+    lines.append(f"  版本           : {cfg.card.version}")
+    if cfg.card.skills:
+        lines.append(f"  技能说明       : {len(cfg.card.skills)} 项（{'、'.join(s.name for s in cfg.card.skills)}）")
+    else:
+        lines.append("  技能说明       : (无)")
+    lines.append("")
     lines.append("[LLM]")
     lines.append(f"  后端           : {cfg.llm.client}")
     lines.append(f"  api_url        : {cfg.llm.api_url}")
@@ -1453,6 +1568,17 @@ def _config_summary_en(cfg: BotConfig) -> str:
         lines.append(f"  auth token    : {mask_secret(cfg.api.token) if cfg.api.token else '(missing; invalid config)'}")
     else:
         lines.append("  chat API      : disabled")
+    lines.append("")
+    lines.append("[Card]")
+    if cfg.card.description:
+        lines.append(f"  description   : {cfg.card.description.splitlines()[0][:60]}")
+    else:
+        lines.append("  description   : (empty; set card.description to say in one line what this Agent does)")
+    lines.append(f"  version       : {cfg.card.version}")
+    if cfg.card.skills:
+        lines.append(f"  skills        : {len(cfg.card.skills)} ({', '.join(s.name for s in cfg.card.skills)})")
+    else:
+        lines.append("  skills        : (none)")
     lines.append("")
     lines.append("[LLM]")
     lines.append(f"  backend       : {cfg.llm.client}")
