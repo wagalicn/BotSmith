@@ -15,7 +15,7 @@ cd /d "%~dp0"
 
 rem ---- Pick bot dir: command-line arg wins, else the hard-coded default ----
 set "BOT_DIR=%~1"
-if not defined BOT_DIR set "BOT_DIR=bots\DemandAgent"
+if not defined BOT_DIR set "BOT_DIR=bots\IThelp-bot"
 
 if not exist "%BOT_DIR%\bot.yaml" (
     echo [x] Bot folder not found: "%BOT_DIR%"
